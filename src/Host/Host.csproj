@@ -1,0 +1,65 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.22621.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <WindowsSdkPackageVersion>10.0.22621.38</WindowsSdkPackageVersion>
+    <RootNamespace>Host</RootNamespace>
+    <!--
+      产物名为「鼠标键盘辅助.exe」（设计文档 §1.4 / §2.2）。
+      Launcher 按此名在同级目录查找宿主，两侧必须一致。
+      注意：不设 AssemblyName 时默认取项目名（Host），与文档不符。
+    -->
+    <AssemblyName>鼠标键盘辅助</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Platforms>x64</Platforms>
+    <!--
+      平台目标必须显式对齐 x64：
+      仅靠 <Platforms>x64</Platforms> 只限制“可选平台”，不决定“本次构建的平台”；
+      解决方案级构建下 PlatformTarget 仍可能落到 AnyCPU/x86，与下面写死的
+      RuntimeIdentifier=win-x64 冲突，报 NETSDK1032。
+    -->
+    <PlatformTarget>x64</PlatformTarget>
+    <UseWinUI>true</UseWinUI>
+    <WinUISDKReferences>false</WinUISDKReferences>
+    <!-- 非打包分发（设计文档 §1.4）：不生成 MSIX，不注册包标识，宿主单文件自包含发布 -->
+    <WindowsPackageType>None</WindowsPackageType>
+    <!--
+      EnableMsixTooling 保持 true，与“非打包”并不矛盾：
+      它保留的是 MSIX 工具链（用于生成 resources.pri 等资源索引），
+      单文件发布（PublishSingleFile）强制要求它（WindowsAppSDK.SingleFile.targets）。
+      “非打包”由 WindowsPackageType=None 决定，而非此开关。
+    -->
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <SelfContained>true</SelfContained>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <!--
+      单文件发布下，Windows App SDK 需要在程序入口前设置
+      MICROSOFT_WINDOWSAPPRUNTIME_BASE_DIRECTORY。
+      本开关让 SDK 自动注入这段初始化，无需手写 Main
+      （WinUI 模板用的是 XamlGeneratedMain，没有可插手的入口）。
+      依据：WindowsAppSDK.SingleFile.targets 第 50-53 行。
+    -->
+    <WindowsAppSdkUndockedRegFreeWinRTInitialize>true</WindowsAppSdkUndockedRegFreeWinRTInitialize>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PublishSingleFile>true</PublishSingleFile>
+    <!-- 单文件下 Dll 同目录重定向所需；targets 有同名默认值，此处显式声明避免依赖隐式默认 -->
+    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
+    <!-- 单文件发布下禁止裁剪：XAML/WinRT 大量依赖反射，裁剪会导致运行时缺类型（实测前的保守设定） -->
+    <PublishTrimmed>false</PublishTrimmed>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <!--
+    包版本固定，不用通配符 "*"：
+    "*" 会让每次还原拉到不同的上游版本，构建不可复现，也让实测结论随时间失效。
+
+    Microsoft.Windows.SDK.BuildTools 不在此显式声明：
+    WindowsAppSDK 依赖链会带上它（并要求 10.0.26100.4654），手写旧版会触发 NU1605 降级冲突。
+    该包是 NuGet 包，自带工具链，不要求本机安装同版本 Windows SDK。
+  -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.5.1" />
+  </ItemGroup>
+</Project>

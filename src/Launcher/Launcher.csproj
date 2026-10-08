@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!--
+      WinExe（无控制台窗口）：Launcher 的职责是"在提权失败时告知用户"，
+      普通用户读不懂控制台输出，控制台窗口只会是噪音（设计文档 §2.2 / AC-26）。
+      失败提示走 Win32 MessageBox。
+    -->
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Launcher</RootNamespace>
+    <AssemblyName>Launcher</AssemblyName>
+    <!-- 普通权限：不得携带 requireAdministrator 清单（设计文档 §1.4）。 -->
+    <Platforms>x64</Platforms>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <!--
+      单文件自包含：与宿主保持同一分发形态（设计文档 §1.4“拷贝即用”）。
+      否则启动壳会散布两百多个文件，把宿主的单文件优势直接抵消掉。
+    -->
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
+    <PublishTrimmed>false</PublishTrimmed>
+  </PropertyGroup>
+
+</Project>
