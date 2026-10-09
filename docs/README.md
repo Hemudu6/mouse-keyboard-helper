@@ -21,11 +21,14 @@ docs/
 **代码侧骨架**（对应设计文档 §2.1 分层）与根目录工程手册：
 
 ```
+src/Core/      纯逻辑工程（任务模型 / 校验器 / 键目录 / 时间轴 / 配置契约），宿主与测试共用
 src/Host/      WinUI 3 宿主（Ui / Engine / Input 三层同项目内文件夹）
 src/Launcher/  启动壳（普通权限）
 tests/         测试层
 AGENTS.md      跨会话工程手册（构建 / 目录 / 验证口径，不复述需求与设计）
 ```
+
+**实现进度（滚动更新）**：`src/Core` 已落地 —— 任务模型（`Model/`）、键目录（`Keys/`）、校验器（`Validation/`）、频率时间轴（`Scheduling/`）、配置契约与存储（`Config/`）、输入模拟决策层（`Input/`：`HoldTable` 按住表 / `InputSimulator` / `IInputSink` / `InjectionFailureLimiter` / `ToggleSnapshot` 开关键快照）；`src/Host` 已落地**业务层**（`Engine/`：`Scheduler` 调度 / `TaskRuntime` 任务运行时 / `TaskRegistry` 任务注册表 / `ConfigStore`）与输入层（`Input/`：`SendInputSink` 注入下落层 + `HookService` 全局钩子，设计见 §3.2~§3.4）；`src/Core/Diagnostics`（`ILogSink` 日志契约 + `AppLogger` 实现）；`src/Host/Engine/HostFacade.cs`（组合根，设计文档 §2.2 / §6.5）**已落地**——持有全局唯一 Logger（最先创建）并向下注入各层；`Ui` 尚未落地（仍为根级窗口骨架）；`src/Launcher` 为骨架。`src/Host/Assets/AppIcon.ico` 为**占位**资产。
 
 ## 文档清单
 
@@ -35,11 +38,14 @@ AGENTS.md      跨会话工程手册（构建 / 目录 / 验证口径，不复�
 | [requirements/待确认问题.md](requirements/待确认问题.md) | 需求 | 哪些点尚待用户拍板 | 无未决问题 |
 | [design/设计文档.md](design/设计文档.md) | 设计 | 怎么做（技术选型 / 架构 / 执行模型 / 界面 / 配置） | 已评审 |
 
+> 设计文档内已实测闭环的结论存档于其 §9.3（构建配方 / 权限口径 / 定时精度 / Core 工程形态）。
+
 ## 分层约定
 
 - **需求层**（`requirements/`）回答"要什么"，不写技术选型与实现方案。
 - **设计层**（`design/`）回答"怎么做"；技术选型与实现方案只写在此层，不复述需求内容。
-- **测试层**（`tests/`）回答“如何验证”；设计文档 §13 只声明验证方式与 AC 的对应关系，**独立的验收测试文档尚未建立**（`tests/Host.Tests` 已建 xUnit 工程骨架，尚无测试用例）。
+- **测试层**（`tests/`）回答“如何验证”；设计文档 §13 只声明验证方式与 AC 的对应关系。`tests/Host.Tests`（xUnit）承载逻辑层单测（任务模型 / 校验器 / 键目录 / 时间轴 / 配置存储 / **输入注入决策层**）；**交互与注入类验收（托盘、钩子、真实 SendInput、单实例）不进单测**，走手工验收清单映射对应 AC。
+  输入注入按设计文档 §13.1 分两层：**决策层**（`InputSimulator` + 假 `IInputSink` + 假时钟）进单测；**下落层**（`SendInputSink` 的真实 `SendInput` 调用）不进单测。
 
 同一机制只在**一个**文档中详述，其他文档引用而不复述。
 
@@ -60,5 +66,10 @@ AGENTS.md      跨会话工程手册（构建 / 目录 / 验证口径，不复�
 | 2026-10-08 | V-2 定时精度实测闭环：`timeBeginPeriod(1)` 实测决定性（关档 5.6~6.2ms vs 开档微秒级）；专用线程与线程池在 10~200 次/秒精度无可区分（保留专用线程为可控性取舍）；20 条并行达成率 ≥99.3%；干扰下中高频最大偏差可恶化至 3~7ms。结论存档设计文档 §9.3，§4.2/§4.3 标注实测支撑，V-2 从 §9.2 移出 |
 | 2026-10-08 | V-7 Launcher 提权失败捕获实测闭环：用户点 UAC「否」⇒ `Win32Exception` `NativeErrorCode=1223`（`ERROR_CANCELLED`），`Start()` 同步阻塞至用户作答；成功判定为「未抛异常」（宿主常驻，`ExitCode` 不可用）；`UseShellExecute=false` 会以 740 直接失败（实现约束）。结论存档设计文档 §9.3，§8 权限口径标注实测支撑，V-7 从 §9.2 移出 |
 | 2026-10-08 | 建立代码骨架（方案 A）：`src/Host`（WinUI 3 宿主）+ `src/Launcher`（启动壳）+ `tests/Host.Tests`（xUnit），入解决方案；新增根目录 `AGENTS.md` 工程手册；本文件补代码侧骨架说明 |
+| 2026-10-08 | 新增 `src/Core` 纯逻辑工程（TFM `net8.0-windows` + `UseWPF`，键码统一 `System.Windows.Input.Key`；宿主与测试共用）；结论存档设计文档 §9.3。实现进度：Core 校验器/任务模型/键目录/时间轴已落地并有单测，宿主仍为空窗口骨架 |
 | 2026-10-08 | 非打包单文件宿主构建配方实测闭环（三次构建失败定位）：TFM 降 22621 + `WindowsSdkPackageVersion`；`EnableMsixTooling` 必须为 true（单文件发布强制）；`WindowsAppSdkUndockedRegFreeWinRTInitialize` 解决入口前环境变量；`SDK.BuildTools` 不手写（避免 NU1605）；包版本定 `2.5.1`（**无 2.0.4**）。发布产物为单个 exe、实测可运行且提权生效。结论存档设计文档 §9.3；§1.4 体积估值与版本待定项同步修正 |
+| 2026-10-08 | S1~S4 实现切片落地：`src/Core/Model`、`Keys`、`Validation`、`Scheduling`、`Config`（契约 + `JsonConfigStore`）、`Input`（`HoldTable` 全局按住表 + `InputSimulator` 注入决策层）；`src/Host/Input/SendInputSink` 下落层。设计文档完成 §3.1 回写（设计定位 / owner 口径 / 归一化口径 / §3.1.1~3.1.3 按住表语义 / §13.1 两层可测性）。测试面扩至 217 例全通过。实现进度与测试层描述同步更新 |
+| 2026-10-09 | B1 裁定回写：**开关键占用改为「主键」口径**——`F8` / `Ctrl+F8` / `Alt+F8` 视为同一主键，保存期即拒绝，且**含已禁用任务**（`TaskValidator.IsSameToggleKey`，与 `IsSameBinding` 完整绑定口径分立，后者仅服务 FR-RUN-03）。设计文档 §3.4.1 同步：同主键合井降级为**防御路径**（手改配置自愈，生产路径不可达），并登记「为何同主键一律拒绝」的论证（漏同步后无法与裸键区分）。需求文档 FR-TOGGLE-05 / AC-05 同步 |
+| 2026-10-09 | S9 设计裁定落笔：新增设计文档 §2.2 组合根 `HostFacade` 行与落点裁定（落 `src/Host/Engine/HostFacade.cs`，不建 `AppServices.cs`）、**§6.5 组合根接线**（接线全图 / 「键→任务 Id」查表同源 / `RunStateChanged` 订阅口径 / 门面自持修饰键按下态 / 托盘与单实例接口）；§5.4 开关键命中信息裁定为**方案 A**（任务 Id 并入快照条目，`TryGetConsume` 签名一字不改）；单实例 IPC 裁定为 `FindWindow` + `PostMessage(WM_APP+1)`、不依赖标题匹配、找不到只提示不重试；V-3 托盘手段实测闭环（主窗口 HWND + 子类化），结论存档 §9.3。本文件实现进度句补 `HostFacade` 已设计未落地 |
+| 2026-10-09 | S10 FR-CFG-05 运行日志落地：新增 `src/Core/Diagnostics`（`ILogSink` 契约 + `AppLogger` 实现），`HostFacade` 组合根最先建全局唯一 Logger 并向下注入各层（各层依赖为 `ILogSink?` 可空）。设计文档 **§7.3 由三行摘要扩写为落地面**（§7.3.1 记录内容与调用契约 / §7.3.2 落点与文件命名 / §7.3.3 滚动与健壮性），§8 汇总表补「日志」行；`AppLoggerTests` 20 例。单文件 publish 实证：`Environment.ProcessPath` 判据成立、发布产物仅三文件、清单 `requireAdministrator` 命中，结论存档 §9.3。测试面 284 例全通过 |
 

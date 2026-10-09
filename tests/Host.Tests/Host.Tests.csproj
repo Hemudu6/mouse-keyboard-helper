@@ -1,10 +1,29 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <!--
+      TFM 与宿主一致（net8.0-windows10.0.22621.0）而非 Core 的 net8.0：
+      本测试工程后续要覆盖 Input 层（InputSimulator / HookService），
+      那两个类直接用 Windows 投影类型，故测试工程本身必须是 Windows 目标。
+      向下兼容：net8.0-windows10.0.22621.0 可以引用 net8.0 的 Core。
+    -->
+    <TargetFramework>net8.0-windows10.0.22621.0</TargetFramework>
+    <Platforms>x64</Platforms>
+    <!--
+      同宿主：解决方案级构建下 PlatformTarget 需显式对齐 x64，
+      否则可能落到 AnyCPU/x86，与 win-x64 运行标识冲突。
+    -->
+    <PlatformTarget>x64</PlatformTarget>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-
+    <!--
+      产物名显式声明为 Host.Tests：
+      Core.csproj 用 InternalsVisibleTo("Host.Tests") 开放内部成员，
+      该名字比对的是**程序集名**，不能依赖"项目名恰好等于程序集名"这一巧合。
+    -->
+    <AssemblyName>Host.Tests</AssemblyName>
+    <RootNamespace>Host.Tests</RootNamespace>
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
   </PropertyGroup>
@@ -20,6 +39,16 @@
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      只引用 Core，**不**引用 Host：
+      Host 是 WinUI 宿主（RequireAdministrator 清单、自包含发布），
+      在测试进程里加载它既无必要也会拖入 WinUI 运行时初始化。
+      需要测试的纯逻辑全部在 Core；Input / Engine 的类同样由 Core 的接口契约约束。
+    -->
+    <ProjectReference Include="..\..\src\Core\Core.csproj" />
   </ItemGroup>
 
 </Project>

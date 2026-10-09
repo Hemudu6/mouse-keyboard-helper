@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!--
+      TFM：net8.0-windows（无 Windows SDK 版本后缀）。
+      带 -windows 是必需的——键盘虚拟键码用的 System.Windows.Input.Key
+      来自 Windows Desktop 参考程序集（WPF 的面），非 Windows 目标下不存在。
+      但**不加**版本后缀（宿主用的是 10.0.22621.0）：Core 不碰任何
+      SDK 投影 API，只用到随 TFM 恒定的 Key 枚举。不锁定 SDK 版本，
+      Core 就不会被 Windows SDK 的补丁版本变化牵动。
+
+      这个 Key 枚举同时决定了 API 形态与序列化形态：
+      不选 System.Windows.Forms.Keys 作项目键码类型，是为了不与
+      System.Windows.Input.Key 并存两套"等价的键码枚举"——
+      输入层要把钩子回调里的 vkCode 与配置比对，两套枚举会引入无谓的映射与错配。
+    -->
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Core</RootNamespace>
+    <AssemblyName>Core</AssemblyName>
+
+    <!-- 纯逻辑库，不参与单文件自包含发布形态；发布参数由宿主与启动壳各自持有。 -->
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      测试工程要访问 Core 的内部成员（如时间轴的微秒精度口径），
+      故开放内部可见性。名字必须是**程序集名**（Host.Tests 的 AssemblyName 已显式声明）。
+    -->
+    <InternalsVisibleTo Include="Host.Tests" />
+  </ItemGroup>
+
+</Project>

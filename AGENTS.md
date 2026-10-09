@@ -24,6 +24,8 @@ Windows 平台的键鼠辅助工具：用户自定义「任务」，任务由若
 
 ```
 src/
+├── Core/          纯逻辑工程（任务模型 / 校验器 / 键目录 / 时间轴 / 配置契约）
+│                  宿主与测试共用；TFM net8.0-windows + UseWPF（键码用 System.Windows.Input.Key）
 ├── Host/          WinUI 3 宿主（requireAdministrator 清单，单文件自包含发布）
 │   ├── Ui/        界面层
 │   ├── Engine/    业务层（Registry / Scheduler / ConfigStore）
@@ -39,6 +41,7 @@ docs/
 
 **分层依赖方向**：`Ui → Engine → Input`；**Input 不得反向依赖 Engine**。
 `Launcher` 独立于三层，仅存在于启动阶段。
+`Core` 被 Host 与 Host.Tests 共同引用；它**不得**引用 Host / Launcher（否则形成循环）。
 
 ## 构建与运行
 

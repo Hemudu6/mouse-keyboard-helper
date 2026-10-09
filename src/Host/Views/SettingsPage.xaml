@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Page
+    x:Class="Host.Views.SettingsPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d">
+
+    <Grid Padding="24" RowSpacing="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <TextBlock Grid.Row="0" Text="设置" Style="{StaticResource TitleTextBlockStyle}" />
+
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+            <StackPanel Spacing="16">
+
+                <Border
+                    CornerRadius="8"
+                    Padding="16"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                    BorderThickness="1">
+                    <StackPanel Spacing="12">
+                        <TextBlock Text="紧急停止键" Style="{StaticResource SubtitleTextBlockStyle}" />
+                        <TextBlock
+                            Text="任何时候按下该键，所有任务立即停止。修改后需保存生效。"
+                            Style="{StaticResource CaptionTextBlockStyle}"
+                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                            TextWrapping="Wrap" />
+                        <StackPanel Orientation="Horizontal" Spacing="12">
+                            <TextBox
+                                x:Name="EmergencyStopBox"
+                                IsReadOnly="True"
+                                Width="220"
+                                PlaceholderText="（未设置）" />
+                            <Button x:Name="CaptureEmergencyStopButton" Content="捕获按键" />
+                            <Button x:Name="ResetEmergencyStopButton" Content="恢复默认" />
+                        </StackPanel>
+                        <ProgressRing x:Name="CaptureRing" IsActive="False" Width="20" Height="20" />
+                    </StackPanel>
+                </Border>
+
+            </StackPanel>
+        </ScrollViewer>
+
+        <StackPanel
+            Grid.Row="2"
+            Orientation="Horizontal"
+            Spacing="12"
+            HorizontalAlignment="Right">
+            <Button x:Name="SaveSettingsButton" Content="保存" Style="{StaticResource AccentButtonStyle}" />
+            <Button x:Name="CancelSettingsButton" Content="取消" />
+        </StackPanel>
+    </Grid>
+</Page>

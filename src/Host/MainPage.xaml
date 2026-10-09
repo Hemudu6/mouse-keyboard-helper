@@ -9,10 +9,35 @@
     mc:Ignorable="d">
 
     <!--
-        This is the main content area of your application.
-        Add your UI elements here — for example, controls, layouts, and data-bound views.
-        Use 'dotnet new winui-page' to create additional pages and navigate to them via
-        the Frame in MainWindow (RootFrame).
+        主页面 = 导航宿主（§6.1 的三个界面：任务列表 / 任务编辑 / 设置）。
+
+        本页只负责**换页**，不承载任何业务：标题栏留在 MainWindow，
+        这里只有一条左侧导航 + 一个内容 Frame。门面通过导航参数逐页传递
+        （见 OnNavigatedTo），页面不反过来找窗口。
     -->
-    <Grid />
+    <Grid>
+        <NavigationView
+            x:Name="Nav"
+            IsBackButtonVisible="Collapsed"
+            IsSettingsVisible="False"
+            PaneDisplayMode="Left"
+            OpenPaneLength="180"
+            SelectionChanged="OnNavSelectionChanged">
+
+            <NavigationView.MenuItems>
+                <NavigationViewItem Content="任务列表" Tag="tasks" IsSelected="True">
+                    <NavigationViewItem.Icon>
+                        <FontIcon Glyph="&#xE8FD;" />
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem Content="设置" Tag="settings">
+                    <NavigationViewItem.Icon>
+                        <FontIcon Glyph="&#xE713;" />
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
+            </NavigationView.MenuItems>
+
+            <Frame x:Name="ContentFrame" />
+        </NavigationView>
+    </Grid>
 </Page>

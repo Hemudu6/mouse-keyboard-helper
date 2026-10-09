@@ -62,4 +62,43 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.5.1" />
   </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      引用 Core（设计文档 §2.1 分层：Ui → Engine → Input，Core 被 Host 与 Host.Tests 共用）。
+      任务模型、校验器、键目录、配置契约、以及输入层的纯逻辑（InputSimulator / HoldTable）
+      全部在 Core；Host 只放平台相关的薄适配（SendInputSink / HookService）。
+    -->
+    <ProjectReference Include="..\Core\Core.csproj" />
+  </ItemGroup>
+
+  <!--
+    应用图标（占位资产）的复制语义。
+
+    同一个文件会被三条路径重复纳入，必须去重，否则发布的复制链路整组失效：
+      ① SDK 默认 None 通配：`<None Include="**/*" />` 覆盖 *.ico（Microsoft.NET.Sdk.DefaultItems.props）
+      ② Microsoft.WinUI.props 的 `<Content Include="Assets/**/*.*" />`（不带任何复制元数据）
+      ③ 下方本项目的显式 Content 项（带复制元数据）
+    三者 TargetPath 相同但元数据不同，ResolveOverlappingItemGroupConflicts 的 Distinct() 去不掉，
+    结果 ResolvedFileToPublish 里同一文件出现三次，下游 _SplitResolvedFileToPublishItems 的
+    条件匹配失效 → _CopyResolvedFilesToPublishPreserveNewest 为空 → publish 产物无 Assets 目录。
+    而 MainWindow.xaml.cs:22 的 AppWindow.SetIcon("Assets/AppIcon.ico") 会因找不到文件失败。
+
+    处理：①③ 各自排除该文件，只留下方唯一一条带复制元数据的显式 Content 项。
+    占位说明（为何不靠通配符）：Assets 目录下除 AppIcon.ico 外不放任何文件——
+    任何新增文件都会重新引入通配符条件匹配问题，此处不再单独维护说明文档。
+  -->
+  <ItemGroup>
+    <None Remove="Assets\AppIcon.ico" />
+    <Content Remove="Assets\AppIcon.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="Assets\AppIcon.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <!-- TargetPath 必须显式给出：缺省时该项的 TargetPath 为空串。 -->
+      <TargetPath>Assets\AppIcon.ico</TargetPath>
+    </Content>
+  </ItemGroup>
 </Project>
