@@ -46,6 +46,28 @@ public sealed partial class TaskListPage : Page
     /// <summary>列表数据源。每项是**显示用的快照行**，不是任务对象本身。</summary>
     private readonly List<TaskListEntry> _entries = new();
 
+    /// <summary>
+    /// 弹窗串行闸（同一页面同一时刻只允许一个 <see cref="ContentDialog"/> 在屏）。
+    ///
+    /// <para>
+    /// <b>为什么必须有</b>：同一个 <c>XamlRoot</c> 上只允许一个 <c>ContentDialog</c>；
+    /// 第二个 <c>ShowAsync()</c> 会抛 <c>COMException 0x80000019</c>。本页多处可弹窗
+    /// （删除确认、<see cref="ShowMessage"/>），而 <see cref="OnDeleteTaskClick"/> 是
+    /// <c>async void</c>——用户在确认框 <c>await</c> 期间再点另一个删除就会走到第二次
+    /// <c>ShowAsync()</c>，抛出的异常没有任何调用方观察得到，**直接成为进程级未处理
+    /// 异常**（宿主带 requireAdministrator，崩了要重新提权启动）。
+    /// </para>
+    /// <para>
+    /// 加锁后并发弹窗退化为**排队**（先确认第一个、再确认第二个），语义正确且不崩溃。
+    /// 锁只覆盖 <c>ShowAsync</c> 本身，不覆盖任何业务逻辑——业务仍在锁外执行。
+    /// </para>
+    /// <para>
+    /// <b>永不嵌套</b>：本页所有弹窗都经 <see cref="ShowDialogAsync"/> 取同一把锁，
+    /// 而该方法内部不再调用任何会弹窗的方法——否则自死锁。
+    /// </para>
+    /// </summary>
+    private readonly SemaphoreSlim _dialogGate = new(1, 1);
+
     /// <summary>构造列表页。</summary>
     public TaskListPage()
     {
@@ -240,7 +262,7 @@ public sealed partial class TaskListPage : Page
             DefaultButton = ContentDialogButton.Close,
         };
 
-        if (await dialog.ShowAsync() != ContentDialogResult.Primary)
+        if (await ShowDialogAsync(dialog) != ContentDialogResult.Primary)
         {
             return;
         }
@@ -348,6 +370,10 @@ public sealed partial class TaskListPage : Page
     /// 异常直接成为进程级未处理异常（没有调用方会观察到它）。
     /// 没人再看这一页，静默丢弃正是正确的。
     /// </para>
+    /// <para>
+    /// 经 <see cref="ShowDialogAsync"/> 弹窗，与删除确认框共享同一把串行闸：
+    /// 提示框排在确认框之后，不再与它撞车抛 <c>COMException</c>。
+    /// </para>
     /// </summary>
     private async void ShowMessage(string title, string? message)
     {
@@ -364,7 +390,41 @@ public sealed partial class TaskListPage : Page
             CloseButtonText = "知道了",
         };
 
-        await dialog.ShowAsync();
+        await ShowDialogAsync(dialog);
+    }
+
+    /// <summary>
+    /// 弹窗统一入口：所有 <c>ContentDialog.ShowAsync()</c> 的**唯一**调用点。
+    ///
+    /// <para>
+    /// <b>为什么必须唯一</b>：同一 <c>XamlRoot</c> 只允许一个 <c>ContentDialog</c> 在屏，
+    /// 并发 <c>ShowAsync()</c> 会抛 <c>COMException (0x80000019)</c>。本方法用
+    /// <see cref="_dialogGate"/> 把并发弹窗**串行化**——后来的弹窗排队等前一个关闭，
+    /// 而不是抛异常；用户连点两个删除时，会依次看到两个确认框。
+    /// </para>
+    /// <para>
+    /// <b>锁的作用域</b>：只包住 <c>ShowAsync</c> 这一句。等待期间业务逻辑（落库、
+    /// 重载列表）不在锁内——若把整个删除流程包进锁，用户在确认框上发呆时
+    /// 页面就完全僵住了。
+    /// </para>
+    /// <para>
+    /// <b>例外安全</b>：<c>finally</c> 保证信号量一定归还，即使 <c>ShowAsync</c> 抛
+    /// （例如页面恰在此时卸载导致 <c>XamlRoot</c> 失效）也不会把整页锁死。
+    /// </para>
+    /// </summary>
+    /// <param name="dialog">已构造好的弹窗。本方法只负责"串行地显示它"。</param>
+    /// <returns>用户的选择结果（主/次/取消按钮）。</returns>
+    private async Task<ContentDialogResult> ShowDialogAsync(ContentDialog dialog)
+    {
+        await _dialogGate.WaitAsync();
+        try
+        {
+            return await dialog.ShowAsync();
+        }
+        finally
+        {
+            _dialogGate.Release();
+        }
     }
 }
 

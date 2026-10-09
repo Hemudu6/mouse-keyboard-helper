@@ -33,6 +33,17 @@ public sealed partial class SettingsPage : Page
     /// <summary>捕获进行中的标志：防止连点两次「捕获按键」叠出两个等待者。</summary>
     private bool _capturing;
 
+    /// <summary>
+    /// 弹窗串行闸：同一 <c>XamlRoot</c> 只允许一个 <see cref="ContentDialog"/> 在屏，
+    /// 并发 <c>ShowAsync()</c> 会抛 <c>COMException (0x80000019)</c>。
+    /// <para>
+    /// 本页唯一的弹窗点是 <see cref="ShowMessage"/>，但捕获失败（钩子不可用 / 超时 /
+    /// 按键被占）与保存被拒可能并发触发。经 <see cref="ShowDialogAsync"/> 串行化后，
+    /// 后来的提示排队而非抛异常。
+    /// </para>
+    /// </summary>
+    private readonly SemaphoreSlim _dialogGate = new(1, 1);
+
     /// <summary>构造设置页。</summary>
     public SettingsPage()
     {
@@ -134,7 +145,7 @@ public sealed partial class SettingsPage : Page
                 "该键可用",
                 "该键当前未被其他程序占用。\n\n注意：本工具的紧急停止通过全局键盘钩子监听，"
                     + "因此该组合即使无人注册，仍可能与系统快捷键语义重叠（例如 Win 系组合），"
-                    + "届时两边都会响应。建议避开系统已定义语义的组合。");
+                    + "届时两边都会响应。");
         }
         else
         {
@@ -230,6 +241,24 @@ public sealed partial class SettingsPage : Page
             CloseButtonText = "知道了",
         };
 
-        await dialog.ShowAsync();
+        await ShowDialogAsync(dialog);
+    }
+
+    /// <summary>
+    /// 弹窗统一入口：本页所有 <c>ContentDialog.ShowAsync()</c> 的唯一调用点。
+    /// 用 <see cref="_dialogGate"/> 把并发弹窗串行化（同 <c>XamlRoot</c> 不允许两个在屏）。
+    /// 锁只包住 <c>ShowAsync</c>；<c>finally</c> 保证信号量归还，不会把页面锁死。
+    /// </summary>
+    private async Task<ContentDialogResult> ShowDialogAsync(ContentDialog dialog)
+    {
+        await _dialogGate.WaitAsync();
+        try
+        {
+            return await dialog.ShowAsync();
+        }
+        finally
+        {
+            _dialogGate.Release();
+        }
     }
 }

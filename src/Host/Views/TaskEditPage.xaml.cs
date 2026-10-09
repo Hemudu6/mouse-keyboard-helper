@@ -41,6 +41,18 @@ public sealed partial class TaskEditPage : Page
     /// <summary>捕获进行中的标志：防止连点两次「捕获按键」叠出两个等待者。</summary>
     private bool _capturing;
 
+    /// <summary>
+    /// 弹窗串行闸：同一 <c>XamlRoot</c> 只允许一个 <see cref="ContentDialog"/> 在屏，
+    /// 并发 <c>ShowAsync()</c> 会抛 <c>COMException (0x80000019)</c>。
+    ///
+    /// <para>
+    /// 本页唯一的弹窗点是 <see cref="ShowMessage"/>，但它可被多个异步流程并发触发
+    /// （捕获失败、保存被拒）。经 <see cref="ShowDialogAsync"/> 串行化后，
+    /// 后来的提示排队而非抛异常。锁只包住 <c>ShowAsync</c>，不包业务逻辑。
+    /// </para>
+    /// </summary>
+    private readonly SemaphoreSlim _dialogGate = new(1, 1);
+
     /// <summary>构造编辑页。</summary>
     public TaskEditPage()
     {
@@ -300,6 +312,10 @@ public sealed partial class TaskEditPage : Page
     /// 会抛异常——而调用方是 <c>async void</c>，异常直接成为进程级未处理异常。
     /// 没人再看这一页，静默丢弃正是正确的。
     /// </para>
+    /// <para>
+    /// 经 <see cref="ShowDialogAsync"/> 串行化：本页提示可由多条异步流程并发触发
+    /// （捕获失败、保存被拒），同 <c>XamlRoot</c> 不允许两个 <c>ContentDialog</c> 在屏。
+    /// </para>
     /// </summary>
     private async Task ShowMessage(string title, string? message)
     {
@@ -316,6 +332,24 @@ public sealed partial class TaskEditPage : Page
             CloseButtonText = "知道了",
         };
 
-        await dialog.ShowAsync();
+        await ShowDialogAsync(dialog);
+    }
+
+    /// <summary>
+    /// 弹窗统一入口：本页所有 <c>ContentDialog.ShowAsync()</c> 的唯一调用点。
+    /// 用 <see cref="_dialogGate"/> 把并发弹窗串行化（同 <c>XamlRoot</c> 不允许两个在屏）。
+    /// 锁只包住 <c>ShowAsync</c>；<c>finally</c> 保证信号量归还，不会把页面锁死。
+    /// </summary>
+    private async Task<ContentDialogResult> ShowDialogAsync(ContentDialog dialog)
+    {
+        await _dialogGate.WaitAsync();
+        try
+        {
+            return await dialog.ShowAsync();
+        }
+        finally
+        {
+            _dialogGate.Release();
+        }
     }
 }
