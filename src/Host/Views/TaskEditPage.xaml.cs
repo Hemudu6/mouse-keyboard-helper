@@ -178,7 +178,12 @@ public sealed partial class TaskEditPage : Page
 
         // 单键开关键（无修饰）会在运行时拦截该键的所有按下——§5.2 要求就此提示。
         // 非阻断：单键是合法配置，提示不得把用户按在原地，也不得阻保存。
-        if (keyEvent.ModifierFamilies.Length == 0)
+        //
+        // **鼠标键除外**：交互拦截只由键盘钩子实施（§3.4 组合命中判定亦仅键盘），
+        // 鼠标键的原始输入不经过它，故"会被拦截"对鼠标键不成立；
+        // 而钩子侧对鼠标不维护修饰键族集合（ModifierFamilies 恒为空，见 BuildBinding），
+        // 不加这道守卫的话，任何一个鼠标单键都会命中下面这个分支、弹出与事实不符的提示。
+        if (keyEvent.ModifierFamilies.Length == 0 && keyEvent.PrimaryKey.Mouse is null)
         {
             BareKeyHintBar.Message =
                 $"「{KeyCatalog.Describe(_draft.ToggleKey)}」不含修饰键，"
@@ -196,8 +201,15 @@ public sealed partial class TaskEditPage : Page
     {
         // 取消可能仍在进行的捕获，避免它稍后回写把这次重置覆盖掉。
         _facade.Hooks.CancelCapture();
+
+        // 提示只在**内容被改写**时才动它：开关键本来就是空的，这次点击什么也没改，
+        // 用户可能正因为提示文本很长而滚上去还没读完，不能顺手把它抹掉。
+        if (_draft.ToggleKey is not null)
+        {
+            BareKeyHintBar.IsOpen = false;
+        }
+
         _draft.ToggleKey = null;
-        BareKeyHintBar.IsOpen = false;
         ShowToggleKey();
     }
 

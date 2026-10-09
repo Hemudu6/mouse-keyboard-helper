@@ -32,6 +32,19 @@ public sealed partial class MainPage : Page
     /// <summary>本次导航是否已经把"任务列表"作为着陆页推过一遍（防止重复导航叠栈）。</summary>
     private bool _landed;
 
+    /// <summary>
+    /// 是否正在由代码回写 <c>Nav.SelectedItem</c>。
+    ///
+    /// <para>
+    /// 回写会再触发一次 <see cref="OnNavSelectionChanged"/>——而那段逻辑会
+    /// <b>退掉整条导航栈</b>。由「编辑页返回列表」这条路径进到这里时，栈里已经没有可退的页面，
+    /// 再跑一遍虽因幂等而不会出错，但那只是巧合（依赖 <c>CurrentSourcePageType</c> 守卫）；
+    /// 若将来有人改动那段逻辑，这个巧合立刻变成”返回时把列表页也退掉”的缺陷。
+    /// 故用显式标志把这次自赋值产生的回调吞掉，不去赌幂等。
+    /// </para>
+    /// </summary>
+    private bool _syncingNavSelection;
+
     /// <summary>构造导航宿主。</summary>
     public MainPage()
     {
@@ -64,6 +77,12 @@ public sealed partial class MainPage : Page
     /// <summary>左侧导航切换：任务列表 / 设置。</summary>
     private void OnNavSelectionChanged(NavigationView sender, NavigationViewSelectionChangedEventArgs args)
     {
+        // 这次选中态是代码回写的，不是用户点的——回写点负责把内容帧摆正，这里不再跑一遍。
+        if (_syncingNavSelection)
+        {
+            return;
+        }
+
         if (args.SelectedItem is NavigationViewItem { Tag: string tag })
         {
             switch (tag)
@@ -124,6 +143,45 @@ public sealed partial class MainPage : Page
         if (ContentFrame.CurrentSourcePageType != typeof(TaskListPage))
         {
             ContentFrame.Navigate(typeof(TaskListPage), Facade);
+        }
+
+        SyncNavSelection("tasks");
+    }
+
+    /// <summary>
+    /// 把左侧导航的选中态拉回与内容帧一致。
+    ///
+    /// <para>
+    /// 内容帧可以不走 <see cref="OnNavSelectionChanged"/> 就被改动（<see cref="GoBackToTaskList"/> 的
+    /// 退栈回退、子页面发起的导航），此时不做同步就会出现”内容已经是任务列表、
+    /// 左侧还高亮着设置“的错配——用户看到的是两个互相矛盾的信号。
+    /// </para>
+    /// </summary>
+    /// <param name="tag">要选中的导航项 <c>Tag</c>。</param>
+    private void SyncNavSelection(string tag)
+    {
+        // 导航控件可能尚未就绪（初始化早期）；此时不同步即可，绝不能抛。
+        foreach (var item in Nav.MenuItems)
+        {
+            if (item is NavigationViewItem { Tag: string itemTag } && itemTag == tag)
+            {
+                if (ReferenceEquals(Nav.SelectedItem, item))
+                {
+                    return; // 已经选中的就是它，不必再走一次赋值/回调。
+                }
+
+                _syncingNavSelection = true;
+                try
+                {
+                    Nav.SelectedItem = item;
+                }
+                finally
+                {
+                    _syncingNavSelection = false;
+                }
+
+                return;
+            }
         }
     }
 }

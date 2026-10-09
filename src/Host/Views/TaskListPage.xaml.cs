@@ -188,7 +188,7 @@ public sealed partial class TaskListPage : Page
     }
 
     /// <summary>
-    /// 复制任务（FR-TASK-06）。
+    /// 复制任务（FR-TASK-04）。
     ///
     /// <para>
     /// 副本必须**重新过一遍全校验**——这一点由门面保证（<c>DuplicateTask</c> 内部
@@ -245,13 +245,26 @@ public sealed partial class TaskListPage : Page
             return;
         }
 
-        Scheduler.Stop(id);
-        if (Facade.RemoveTask(id) is null)
+        // 只调 Facade.RemoveTask：它内部已经在 _wiringGate 内做了 Scheduler.Stop
+        // （"先停再删"是门面的语义，见 HostFacade.RemoveTask）。页面再补一次 Stop
+        // 是绕过门面串行化的重复调用——将来停止时机一变，这条路径会静默偏离。
+        // 删除可能抛（Store 落盘失败等），用 finally 保证列表一定重载：
+        // 否则界面会停留在"已删除"的陈旧视图上，而库里其实还在。
+        try
         {
-            ShowMessage("删除失败", $"「{name}」不在任务列表中。");
+            if (Facade.RemoveTask(id) is null)
+            {
+                ShowMessage("删除失败", $"「{name}」不在任务列表中。");
+            }
         }
-
-        ReloadTasks();
+        catch (Exception ex)
+        {
+            ShowMessage("删除失败", ex.Message);
+        }
+        finally
+        {
+            ReloadTasks();
+        }
     }
 
     /// <summary>
@@ -275,14 +288,22 @@ public sealed partial class TaskListPage : Page
         }
 
         var wanted = toggle.IsOn;
-        var task = Facade.Tasks.Snapshot().FirstOrDefault(t => t.Id == id);
-        if (task is null || task.Enabled == wanted)
+
+        // 必须**先拷一份**再改：Snapshot() 复制的只是数组，元素仍是注册表的
+        // 内部引用（TaskRegistry.Snapshot 的实现如此）。直接在取到的对象上赋
+        // Enabled，等于就地改生效中的任务——校验一旦不过，对象已被改脏，
+        // 接下来 ReloadTasks() 读到的正是脏值：界面显示"已启用"，而这次保存
+        // 其实被拒、磁盘也没落。三方不一致且要到重启才对齐。
+        var current = Facade.Tasks.Snapshot().FirstOrDefault(t => t.Id == id);
+        if (current is null || current.Enabled == wanted)
         {
             return;
         }
 
-        task.Enabled = wanted;
-        var result = Facade.UpdateTask(task);
+        var edited = TaskDraft.FromDefinition(current).ToDefinition();
+        edited.Enabled = wanted;
+
+        var result = Facade.UpdateTask(edited);
         if (!result.IsValid)
         {
             // 保存被拒：重载列表把开关拨回原位，并把原因告诉用户（不静默）。
@@ -317,9 +338,24 @@ public sealed partial class TaskListPage : Page
     private static Guid? TagAsGuid(object sender)
         => sender is FrameworkElement { Tag: Guid id } ? id : null;
 
-    /// <summary>非阻断提示：列表页的动作没有"取消"语义，弹窗只用来告知结果。</summary>
+    /// <summary>
+    /// 非阻断提示：列表页的动作没有"取消"语义，弹窗只用来告知结果。
+    ///
+    /// <para>
+    /// <b>页面已卸载时直接返回</b>：本方法在 <c>await</c> 之后才构造弹窗，
+    /// 此时用户可能已经导航走了。页面一离开视觉树，<c>XamlRoot</c> 就变成 <c>null</c>，
+    /// 再拿它构造 <c>ContentDialog</c> 会抛异常——而本方法是 <c>async void</c>，
+    /// 异常直接成为进程级未处理异常（没有调用方会观察到它）。
+    /// 没人再看这一页，静默丢弃正是正确的。
+    /// </para>
+    /// </summary>
     private async void ShowMessage(string title, string? message)
     {
+        if (XamlRoot is null)
+        {
+            return;
+        }
+
         var dialog = new ContentDialog
         {
             XamlRoot = XamlRoot,

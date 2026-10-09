@@ -15,8 +15,41 @@ public sealed class TaskDefinition
     /// <summary>
     /// 任务标识。仅用于程序内定位（运行期状态表、配置增删改），不面向用户显示。
     /// 用 <see cref="Guid"/> 而非名字：名字可改，改名字不应打断正在运行的任务的定位。
+    ///
+    /// <para>
+    /// <b><see cref="Guid.Empty"/> 是禁用值</b>：开关快照用空 Guid 表示
+    /// "这次点按没有命中任何任务"（<c>ToggleSnapshot</c> 的未命中哨兵）。
+    /// 一个带空 Id 的任务混进列表，其开关键会被当成"未命中"直接丢弃，
+    /// 且与别的空 Id 任务互相冒充。故任何进入列表的任务都必须带真 Id——
+    /// 由 <see cref="EnsureId"/> 兜住。
+    /// </para>
     /// </summary>
     public Guid Id { get; set; } = Guid.NewGuid();
+
+    /// <summary>
+    /// 保证本对象带一个非空 Id；为空时当场分配一个并返回。
+    ///
+    /// <para>
+    /// <b>用途</b>：界面新建路径（任务编辑草稿）会显式把 Id 写成
+    /// <see cref="Guid.Empty"/> 以表示"这是新任务"，提交入库时必须在此补齐。
+    /// 把这一步放在 Core 而非宿主，是为了让"空 Id 不得入库"这条不变式
+    /// 可被纯逻辑单测覆盖（宿主带管理员清单，不进测试进程）。
+    /// </para>
+    /// <para>
+    /// 返回 <c>true</c> 表示本次调用**新分配**了 Id（调用方据此判断"这是新建"），
+    /// <c>false</c> 表示原本就有 Id、未被改动。
+    /// </para>
+    /// </summary>
+    public bool EnsureId()
+    {
+        if (Id != Guid.Empty)
+        {
+            return false;
+        }
+
+        Id = Guid.NewGuid();
+        return true;
+    }
 
     /// <summary>任务名（用户可见）。</summary>
     public string Name { get; set; } = string.Empty;

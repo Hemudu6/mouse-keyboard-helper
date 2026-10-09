@@ -205,8 +205,23 @@ public sealed partial class SettingsPage : Page
 
     // ── 工具 ──────────────────────────────────────────────────────
 
+    /// <summary>
+    /// 阻断式提示：保存失败必须停在原地让用户读完再改。
+    ///
+    /// <para>
+    /// <b>页面已卸载时直接返回</b>：本页的提示都发生在 <c>await</c> 之后（后台等捕获、保存回写），
+    /// 此时用户可能已经保存/取消导航走了。页面一离开视觉树，<c>XamlRoot</c> 就变成 <c>null</c>，
+    /// 再拿它构造 <c>ContentDialog</c> 会抛异常——而调用方是 <c>async void</c>，
+    /// 异常直接成为进程级未处理异常。没人再看这一页，静默丢弃正是正确的。
+    /// </para>
+    /// </summary>
     private async Task ShowMessage(string title, string? message)
     {
+        if (XamlRoot is null)
+        {
+            return;
+        }
+
         var dialog = new ContentDialog
         {
             XamlRoot = XamlRoot,

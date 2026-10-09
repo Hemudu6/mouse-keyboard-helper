@@ -83,7 +83,18 @@ public sealed class TaskRegistry
         Persist();
     }
 
-    /// <summary>当前任务列表的**快照**（副本，调用方可安全持有与遍历）。</summary>
+    /// <summary>
+    /// 当前任务列表的快照。
+    ///
+    /// <para>
+    /// <b>返回的只是"列表结构"的副本，元素是内部引用</b>。本方法是
+    /// <c>_tasks.ToArray()</c>——复制的是数组本身，数组里的
+    /// <see cref="TaskDefinition"/> 与注册表持有的**是同一批对象**。
+    /// 因此：<b>遍历安全，改动不安全</b>。只读使用（界面展示、快照构建）
+    /// 没有问题；要修改某个任务，必须先拷一份（例如经 <c>TaskDraft</c>），
+    /// 否则就是在就地改生效中的对象——校验失败时无处回滚。
+    /// </para>
+    /// </summary>
     public IReadOnlyList<TaskDefinition> Snapshot()
     {
         lock (_gate)
@@ -102,7 +113,7 @@ public sealed class TaskRegistry
     }
 
     /// <summary>
-    /// 新增任务（FR-TASK-02）。校验不过则**不写入**，返回问题清单。
+    /// 新增任务（FR-TASK-01）。校验不过则**不写入**，返回问题清单。
     /// </summary>
     public ValidationResult Add(TaskDefinition task, KeyBinding emergencyStopKey)
     {
@@ -124,7 +135,7 @@ public sealed class TaskRegistry
     }
 
     /// <summary>
-    /// 更新任务（FR-TASK-04）。按 <see cref="TaskDefinition.Id"/> 定位，
+    /// 更新任务（FR-TASK-02）。按 <see cref="TaskDefinition.Id"/> 定位，
     /// 校验时自动排除自身（改自己的名字不算重名）。
     /// </summary>
     public ValidationResult Update(TaskDefinition task, KeyBinding emergencyStopKey)
@@ -180,7 +191,7 @@ public sealed class TaskRegistry
     }
 
     /// <summary>
-    /// 复制任务（FR-TASK-05）：深拷贝 + 名字加「 - 副本」+ 重过校验。
+    /// 复制任务（FR-TASK-04）：深拷贝 + 名字加「 - 副本」+ 重过校验。
     ///
     /// 名字加后缀后仍可能重名（已有「A - 副本」时再复制 A），
     /// 此时按校验规则**拒绝**并返回问题，由用户在编辑界面自己改名——

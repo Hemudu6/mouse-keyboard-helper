@@ -187,14 +187,37 @@ public sealed class HostFacade : IDisposable
 
     // ── 任务列表的变更入口（每个都在末尾推快照）──────────────────────
 
-    /// <summary>新增任务并推送新快照（FR-TASK-02）。校验不过则不写入、不推送。</summary>
+    /// <summary>
+    /// 新增任务并推送新快照（FR-TASK-01）。校验不过则不写入、不推送。
+    ///
+    /// <para>
+    /// <b>Id 在此分配</b>：界面新建路径（<c>TaskDraft.CreateNew</c>）产出的草稿带
+    /// <see cref="Guid.Empty"/>，需要由门面发一个真 Id —— 这不是"顺手补一行"，
+    /// 而是 <c>Guid.Empty</c> 在本系统里另有一处**语义占用**：开关快照用
+    /// <c>Guid.Empty</c> 表示"这次点按没有命中任何任务"（<c>ToggleSnapshot</c> 的哨兵值）。
+    /// 若不分配，新任务的 Id 恰等于哨兵值，钩子侧会把它的开关键当成"未命中"丢弃，
+    /// 表现为**新建的任务开关键完全失效**；同时多个新建任务共用一个 Id，
+    /// 编排器/注册表按 Id 定位会全部退化为"第一个"。
+    /// </para>
+    /// <para>
+    /// 分配必须在**校验之前**：校验器与快照构建都要读真实 Id。
+    /// </para>
+    /// </summary>
     public ValidationResult AddTask(TaskDefinition task)
     {
         ThrowIfDisposed();
-        return ApplyChange(() => Tasks.Add(task, CurrentSettings.EmergencyStopKey));
+        ArgumentNullException.ThrowIfNull(task);
+
+        return ApplyChange(() =>
+        {
+            // 只在调用方没给 Id 时补——按 Id 显式构造的任务（导入/测试）保持原样。
+            task.EnsureId();
+
+            return Tasks.Add(task, CurrentSettings.EmergencyStopKey);
+        });
     }
 
-    /// <summary>更新任务并推送新快照（FR-TASK-04）。</summary>
+    /// <summary>更新任务并推送新快照（FR-TASK-02）。</summary>
     public ValidationResult UpdateTask(TaskDefinition task)
     {
         ThrowIfDisposed();
@@ -202,11 +225,11 @@ public sealed class HostFacade : IDisposable
     }
 
     /// <summary>
-    /// 删除任务（FR-TASK-05）。
+    /// 删除任务（FR-TASK-03）。
     ///
     /// <para>
     /// <b>先停再删</b>：任务正在跑时把它从列表移除，它的循环仍在注入——必须
-    /// 先把调度器里那个任务停掉。删除是"立刻生效"的语义（FR-TASK-05），
+    /// 先把调度器里那个任务停掉。删除是"立刻生效"的语义（FR-TASK-03），
     /// 所以这里用同步 <see cref="Scheduler.Stop"/> 而非等循环自己退出。
     /// </para>
     /// <para>
@@ -239,7 +262,7 @@ public sealed class HostFacade : IDisposable
         }
     }
 
-    /// <summary>复制任务并推送新快照（FR-TASK-06）。名字重名等校验问题由 Registry 返回。</summary>
+    /// <summary>复制任务并推送新快照（FR-TASK-04）。名字重名等校验问题由 Registry 返回。</summary>
     public (TaskDefinition? Copy, ValidationResult Result) DuplicateTask(Guid taskId)
     {
         ThrowIfDisposed();

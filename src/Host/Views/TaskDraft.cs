@@ -23,7 +23,7 @@ public sealed class TaskDraft
     /// <summary>新建任务的开关默认键（与 <c>TaskDefinition</c> 的默认值一致）。</summary>
     private static readonly System.Windows.Input.Key DefaultToggleKey = System.Windows.Input.Key.F6;
 
-    /// <summary>任务 Id。新建时为 <see cref="Guid.Empty"/>，保存时由门面分配。</summary>
+    /// <summary>任务 Id。新建时为 <see cref="Guid.Empty"/>，保存时由门面分配（<c>HostFacade.AddTask</c> 调 <c>TaskDefinition.EnsureId</c>）。</summary>
     public Guid Id { get; set; }
 
     /// <summary>是否为新建（决定保存走 <c>AddTask</c> 还是 <c>UpdateTask</c>）。</summary>
