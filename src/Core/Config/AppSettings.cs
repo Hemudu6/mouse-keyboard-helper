@@ -111,10 +111,26 @@ public sealed record ConfigLoadResult<T>(
 /// </summary>
 /// <param name="Succeeded">是否写盘成功。</param>
 /// <param name="Message">失败原因（面向用户）；成功时为 <c>null</c>。</param>
-public sealed record ConfigSaveResult(bool Succeeded, string? Message = null)
+/// <param name="Value">
+/// 实际落盘的那一份数据（成功时才有意义）。
+///
+/// <para>
+/// <b>为什么要有它</b>：入参可能是 <c>null</c>，而存储层会把它换成一份默认设置再落盘——
+/// 此时"调用方手上的东西"与"磁盘上的东西"是两份不同的对象。调用方（门面）的内存态
+/// 必须以**落盘的那一份**为准，否则内存与磁盘当场分家：界面改完设置后读到的仍是旧值，
+/// 紧急停止键表现为"改了要重启才生效"（设计文档 §7.1）。
+/// </para>
+/// <para>
+/// 失败时为 <c>null</c>——没落盘就没有"落盘的那一份"。
+/// </para>
+/// </param>
+public sealed record ConfigSaveResult(bool Succeeded, string? Message = null, AppSettings? Value = null)
 {
-    /// <summary>写入成功。</summary>
-    public static ConfigSaveResult Ok { get; } = new(true);
+    /// <summary>
+    /// 写入成功。<paramref name="value"/> 是**实际落盘的那一份**设置；
+    /// 不落设置的写入路径（如仅写任务）传 <c>null</c>——没落盘就没有那一份。
+    /// </summary>
+    public static ConfigSaveResult Ok(AppSettings? value = null) => new(true, null, value);
 
     /// <summary>构造一个失败结果。</summary>
     public static ConfigSaveResult Fail(string message) => new(false, message);

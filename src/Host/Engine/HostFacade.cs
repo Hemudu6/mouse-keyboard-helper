@@ -33,11 +33,14 @@ namespace Host.Engine;
 ///       构造注入。全进程**只有一个** <see cref="InputSimulator"/>——按住表是全局唯一一张
 ///       （§3.1.1），所以必须先建模拟器再建调度器。</item>
 /// <item><see cref="HookService"/>：独立持有，<see cref="Start"/> 装钩子、<see cref="Dispose"/> 摘钩子。</item>
-/// <item><see cref="HookService.ToggleRequested"/> → 查表 → <see cref="Scheduler.Toggle"/>：事件订阅。
+/// <item><see cref="HookService.ToggleRequested"/> → 判归属 → <see cref="Scheduler.Toggle"/> / 
+///       逐任务 <see cref="Scheduler.Stop"/>：事件订阅。载荷里携带任务 Id（<c>null</c> = 紧急停止，
+///       FR-RUN-01；非 <c>null</c> = 任务开关，§3.5.2）。
 ///       事件在**投递线程**抛出，订阅回调必须立刻返回（§3.2 回调最小化）。</item>
-/// <item>任务列表变更 → 重建快照 → <see cref="HookService.UpdateToggleTable"/>：单向推送。
-///       <b>漏推的后果是"新任务的开关键不生效"</b>——故本类的每个增删改入口都在末尾调
-///       <see cref="RefreshToggleTable"/>，没有例外。</item>
+/// <item>任务列表变更 / 全局设置变更 → 重建快照 → <see cref="HookService.UpdateToggleTable"/>：单向推送。
+///       <b>漏推的后果是“新任务的开关键不生效”或“紧急停止键改了不生效”</b>——故本类的
+///       每个增删改入口都在末尾调 <see cref="RefreshToggleTable"/>，没有例外；
+///       设置保存路径（会改紧急停止键）同理（§3.5.4）。</item>
 /// <item><see cref="ILogSink"/>（实作 <see cref="AppLogger"/>）：全局唯一，落盘到
 ///       配置目录下的 <c>logs\</c>（§7.3）。全部错误源（注入失败 / 命令循环异常 /
 ///       落盘失败 / 设置保存失败 / 钩子启停失败）与业务事件（任务启停）均由本类
@@ -58,13 +61,29 @@ public sealed class HostFacade : IDisposable
     private readonly object _wiringGate = new();
 
     /// <summary>
-    /// 取快照的串行化门。与 <see cref="_wiringGate"/> 分开是因为它还要挡
-    /// <see cref="ToggleRequestedHandler"/>：钩子投递线程上取快照时，
-    /// 不能在 UI 改列表的中途看到半成品快照。
+    /// 快照发布与事件处理之间的交接锁。见 <see cref="RefreshToggleTable"/> 与
+    /// <see cref="ToggleRequestedHandler"/>：前者在锁内发布 <see cref="_snapshot"/>，
+    /// 后者在锁内读任务注册表——两者同锁，事件处理就不会插在“新表已发布”
+    /// 与“新表已推给钩子”中间。
     /// </summary>
+    /// <remarks>
+    /// <b>它做不到什么（写下来免得后人误会）</b>：推送 <see cref="HookService.UpdateToggleTable"/>
+    /// 不在锁内，且 <see cref="TaskRegistry"/> 自身是线程安全的。
+    /// 所以真实存在的竞态窗口只有“快照刚建好、钩子或任务注册表已被改”这一种，
+    /// 它的后果是**一条**开关事件被静默丢弃（<see cref="Tasks"/> 里查不到那个 Id），
+    /// 既不会启错任务、也不会漏启任务：下一次点按就对了。
+    /// 本锁把“发布”与“查任务”排了个固定的先后，仅此而已——
+    /// 它**不**保证“钩子手上的表”与“门面手上的注册表”永远一致，那也不是它能做到的。
+    /// </remarks>
     private readonly object _snapshotGate = new();
 
-    /// <summary>最近一次重建后交给钩子的快照（开关命中时用它查任务 Id）。</summary>
+    /// <summary>
+    /// 最近一次重建并推给钩子的快照。**只被 <see cref="RefreshToggleTable"/> 写、
+    /// 不被任何回调读**——门面手上那份表就是它，而回调查任务走
+    /// <see cref="TaskRegistry.Find"/>，故它不参与查表。
+    /// 它的作用是让 <see cref="_snapshotGate"/> 下的“发布→推送”成为一次不可分的状态转变，
+    /// 而不是供查表用。
+    /// </summary>
     private ToggleSnapshot _snapshot = ToggleSnapshot.Empty;
 
     /// <summary>
@@ -85,7 +104,7 @@ public sealed class HostFacade : IDisposable
         Tasks.Load();
 
         Settings = Store.LoadSettings();
-        var settings = Settings.Value ?? new AppSettings();
+        _currentSettings = Settings.Value ?? new AppSettings();
 
         // ② 输入链路：Simulator 必须先于 Scheduler（按住表全局唯一）。
         //    注入失败经模拟器的 60s 时间窗聚合后进日志（§7.3）——同一类失败
@@ -125,14 +144,40 @@ public sealed class HostFacade : IDisposable
     /// <summary>配置存储（界面的"打开配置目录"等功能可能要用）。</summary>
     public JsonConfigStore Store { get; }
 
+    /// <summary>
+    /// 当前生效的设置（<see cref="CurrentSettings"/> 的实体）。
+    ///
+    /// <para>
+    /// 它会被钩子投递线程上的紧急停止路径读到，所以用 <see cref="Volatile"/> 读写——
+    /// 引用赋值本身是原子的，要的只是“看到的是换之前还是换之后那一个”这件事别被
+    /// 寄存器缓存住。为这一个字段上锁不值得，而错读的代价只是“本次按下用旧键”，
+    /// 下一次按下就对上了。
+    /// </para>
+    /// </summary>
+    private AppSettings _currentSettings;
+
     /// <summary>任务注册表（界面增删改任务的入口）。</summary>
     public TaskRegistry Tasks { get; }
 
     /// <summary>全局设置的载入结果（含损坏提示，AC-21 / FR-CFG-02）。</summary>
+    /// <remarks>
+    /// 这是**载入时那一次**的结果——保存会换掉内存里的设置，但载入结果不该被改写
+    /// （它的 <see cref="ConfigLoadResult{T}.Recovery"/> / <c>Message</c> 描述的是启动那一刻
+    /// 发生过什么，事后改写会让“那份损坏提示”变得不可追溯）。读当前值请用
+    /// <see cref="CurrentSettings"/>。
+    /// </remarks>
     public ConfigLoadResult<AppSettings> Settings { get; }
 
-    /// <summary>全局设置（已补默认值；界面改后用 <see cref="SaveSettings"/> 落盘）。</summary>
-    public AppSettings CurrentSettings => Settings.Value ?? new AppSettings();
+    /// <summary>
+    /// 全局设置（已补默认值；界面改后用 <see cref="SaveSettings"/> 落盘）。
+    ///
+    /// <para>
+    /// 它是**可变的当前值**：保存成功后由 <see cref="SaveSettings"/> 换成实际落盘的那一份。
+    /// 界面改设置后立刻读它（包括重新推快照）拿到的才是新值——
+    /// 若它永远等于启动时载入的那份，紧急停止键就会“改了要重启才生效”（§3.5.4）。
+    /// </para>
+    /// </summary>
+    public AppSettings CurrentSettings => Volatile.Read(ref _currentSettings);
 
     /// <summary>输入模拟器（界面一般不需要，托盘退出等路径由本类代劳）。</summary>
     public InputSimulator Input { get; }
@@ -305,9 +350,14 @@ public sealed class HostFacade : IDisposable
     /// 保存全局设置（FR-CFG-06）。
     ///
     /// <para>
-    /// <b>保存后立即刷新紧急停止键？</b>——本工程的紧急停止落在钩子侧的
-    /// <see cref="KeyBinding"/> 上，而快照只承载开关表；紧急停止键的独立钩子路径
-    /// 由批次五接线，此处只负责落盘，不声称已生效。
+    /// <b>保存成功后立即重推快照</b>（FR-RUN-01，§3.5.4）：紧急停止键就在
+    /// <see cref="CurrentSettings"/> 里，改完不重推则钩子手上仍是旧快照，
+    /// 表现为"紧急停止键改了不生效，重启后才对"——而改键往往正是因为它与
+    /// 别的软件撞了，用户当场就要验证，这种"重启才对"的延迟最伤信任。
+    /// </para>
+    /// <para>
+    /// <b>只在保存成功时重推</b>：失败时新设置没落盘，推一份基于未落盘设置的快照
+    /// 会造成"本次会话生效、下次启动又不是这样"的静默不一致。
     /// </para>
     /// </summary>
     /// <returns>落盘结果（失败时界面须提示，AC-37）。</returns>
@@ -323,8 +373,18 @@ public sealed class HostFacade : IDisposable
             // 两条都要——弹窗一关就什么都不剩，而用户回头报"设置改了没保持"时
             // 日志是唯一能对上号的证据。
             Logger.Error($"全局设置保存失败：{result.Message}");
+            return result;
         }
 
+        // 先换内存里的设置、再重建快照——顺序不能反：RefreshToggleTable 会去
+        // 读 CurrentSettings.EmergencyStopKey，设置没换就推的还是一份旧键的快照。
+        // 写回的是**实际落盘的那一份**（result.Value）而非入参：入参可能是 null
+        // 被存储层换成默认设置，内存继续拿着入参会与磁盘当场分家。
+        // 这是 CurrentSettings 陈旧问题的修复点（§3.5.4 / §6.5.1）——
+        // 原来此处只落盘不更新内存，界面改完设置后 CurrentSettings 仍是旧值，
+        // 于是紧急停止键"改了要重启才生效"。
+        _currentSettings = result.Value ?? settings;
+        RefreshToggleTable();
         return result;
     }
 
@@ -397,13 +457,21 @@ public sealed class HostFacade : IDisposable
     /// 是"锁内状态迁移 + 锁外起线程"，不会把任务循环的实质工作压在本线程上。
     /// </para>
     /// <para>
+    /// <b>两类事件的归属判定分岔点在这里</b>（§3.5.2）：载荷里任务 Id 为 <c>null</c>
+    /// 即紧急停止，非 <c>null</c> 即任务开关。归属判定必须在**最前面**做，
+    /// 且早于下面的 <paramref name="isKeyDown"/> 早退——因为这两类命中的时间口径相反：
+    /// 任务开关只认**松开**（点按语义，§3.4），紧急停止只认**按下**（保险丝语义，§3.5.3）。
+    /// 二者不可共用同一道早退门。
+    /// </para>
+    /// <para>
     /// <b>只认松开</b>：点按语义在松开的瞬间成立（§3.4 点火语义），按下的那一次
     /// 事件直接忽略——否则一次点按会触发两轮启停，任务看起来"点了没反应"。
+    /// （该规矩只适用于任务开关；紧急停止的按下事件已在上面被接走。）
     /// </para>
     /// </summary>
-    private void ToggleRequestedHandler(PhysicalKey key, bool isKeyDown, string[] modifierFamilies)
+    private void ToggleRequestedHandler(PhysicalKey key, bool isKeyDown, string[] modifierFamilies, Guid? taskId)
     {
-        if (_disposed || isKeyDown)
+        if (_disposed)
         {
             return;
         }
@@ -411,27 +479,67 @@ public sealed class HostFacade : IDisposable
         // 查任务 Id 必须与钩子同源（§6.5.2 ①）：用同一份快照的归一表查，
         // 而不是拿原始键去 TaskRegistry 里比对——快照内部做族归一、TaskDefinition
         // 存的是原始键，另起一张表就会在"配右 Ctrl 的组合开关"上查不中。
-        // 钩子已经把命中时的按 ToggleRequested 事件转发过来（第三参数）。
-        TaskDefinition? task;
-        lock (_snapshotGate)
+        // 钩子已经把命中时的任务 Id 算好并随事件带来（第四参数）。
+        TaskDefinition? task = null;
+        if (taskId is not null)
         {
-            if (!_snapshot.TryGetTaskId(key, modifierFamilies, out var taskId))
+            lock (_snapshotGate)
             {
-                // 查不到任务即静默丢弃（§6.5.2 ②）：键在表内但任务已删除/已禁用
-                // 是合法且常见的中间态（删任务时事件可能正在队列里排队）。
-                return;
+                // 用钩子算定的任务 Id 直接查（§3.5.2）：归属在回调侧一次算定、全程带下来，
+                // 此处不再重算——否则与钩子的判定口径一旦漂移（如族集合快照时机不同），
+                // 就会出现"钩子按 A 任务吞了键、门面查出 B 任务"的静默串台。
+                task = Tasks.Find(taskId.Value);
             }
-
-            task = Tasks.Find(taskId);
         }
 
-        if (task is null || !task.Enabled)
+        // 时间口径与归属分流**唯一判定处**（§3.5.3）：组合表在 Core 里，
+        // 与钩子侧归属解析共用一个口径，且有单测钉住。
+        // 这段判定原先内联在此处，曾以「归属解析在松开侧返回 null」的形态倒置：
+        // 紧急停止的松开被当动作、任务开关的按下与松开全被丢弃，
+        // 而编译期与单测都不显形——下沉 Core 就是为了不再重演。
+        switch (ToggleDispatchPolicy.Decide(isKeyDown, taskId, task is not null, task?.Enabled ?? false))
         {
-            // 快照与列表之间的合法时间差，同样静默丢弃。
-            return;
-        }
+            case ToggleDispatch.EmergencyStop:
+                StopAllRunningTasks();
+                return;
 
-        Scheduler.Toggle(task);
+            case ToggleDispatch.ToggleTask:
+                Scheduler.Toggle(task!);
+                return;
+
+            default:
+                // 快照与列表之间的合法时间差、停用任务、以及非动作的那两个组合：静默丢弃。
+                return;
+        }
+    }
+
+    /// <summary>
+    /// 紧急停止：把**全部运行中**的任务逐个停掉（FR-RUN-01，§3.5.7）。
+    ///
+    /// <para>
+    /// <b>逐任务 <see cref="Scheduler.Stop"/>，不用 <see cref="Scheduler.StopAll"/></b>：
+    /// 两者都停任务，但 <c>StopAll</c> 带着"整体清场"的语义（退出路径在用），
+    /// 而紧急停止是**用户的一次操作**，不是收尾——它的语义边界应与"再点一次开关"
+    /// 同类，即"停任务、不改启用状态、不碰别的"。用窄接口把语义边界守在调用点，
+    /// 将来 <c>StopAll</c> 若因退出路径需要加收尾动作，也不会莫名其妙地被紧急停止继承。
+    /// </para>
+    /// <para>
+    /// <b>不改启用状态</b>：停止是运行态，启用是配置态。紧急停止后用户再点一次开关
+    /// 就应该能重新跑起来——若把它做成了"停用"，紧急停止就成了隐形的配置修改，
+    /// 用户下次启动会发现"任务怎么都不跑了"，且无从归因。
+    /// </para>
+    /// <para>
+    /// <b>先拍列表快照再逐个停</b>：<see cref="TaskRegistry.Snapshot"/> 是当下时刻的
+    /// 列表副本，遍历它而不是边遍历边问注册表，避免停止过程中列表被改动引发的
+    /// 枚举异常。已经停了的任务再 <c>Stop</c> 一次是安全的（调度器内部幂等）。
+    /// </para>
+    /// </summary>
+    private void StopAllRunningTasks()
+    {
+        foreach (var task in Tasks.Snapshot())
+        {
+            Scheduler.Stop(task.Id);
+        }
     }
 
     /// <summary>
@@ -444,20 +552,28 @@ public sealed class HostFacade : IDisposable
     /// 而任务数是个位数级别，这个代价可以忽略。
     /// </para>
     /// <para>
-    /// <b>先更新本地快照、再推给钩子</b>：本类的 <see cref="_snapshot"/> 是
-    /// 事件回调查任务 Id 的依据，必须与钩子手上那份是同一个对象，
-    /// 否则会出现"钩子按新表吞了键、门面按旧表查不到任务"的静默失配。
+    /// <b>同时传入紧急停止键</b>（FR-RUN-01，§3.5.1）：紧急停止表与开关表由同一份
+    /// 快照承载、同行重建——两张表若各自维护，“紧急停止键与开关同键”这类交叉约束
+    /// 就没有一个能同时看到两者的地方去守。构建期会把与紧急停止键同主键的开关绑定排除掉。
+    /// </para>
+    /// <para>
+    /// <b>构建与发布在锁内、推送在锁外</b>：锁里做的事只有“把新表挂到
+    /// <see cref="_snapshot"/>”这一下；向钩子推送排在其后。
+    /// 这样排是为了让“门面已认新表”必须发生在“钩子已可判新表”之前——
+    /// 反过来的话，钩子会按新表判出一次命中、而门面那边那个任务还不存在。
     /// </para>
     /// </summary>
     private void RefreshToggleTable()
     {
-        var snapshot = ToggleSnapshot.Build(Tasks.Snapshot());
+        var snapshot = ToggleSnapshot.Build(Tasks.Snapshot(), CurrentSettings.EmergencyStopKey);
 
         lock (_snapshotGate)
         {
             _snapshot = snapshot;
         }
 
+        // 推送在锁外，理由见上：把“发布”与“推送”之间的窗口留给事件处理，
+        // 而不是把钩子挡在锁外等。
         Hooks.UpdateToggleTable(snapshot);
     }
 

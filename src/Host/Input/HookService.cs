@@ -126,61 +126,50 @@ internal sealed class HookService : IDisposable
     /// <summary>录制到的那一次按键；<c>null</c> = 尚无。</summary>
     private CaptureEvent? _capturedEvent;
 
+    /// <summary>
+    /// 录制期「已按下但尚未松开」的键集合（仅回调线程读写，无锁）。
+    ///
+    /// <para>
+    /// <b>为什么需要它</b>：捕获的完成判据是「已按下的键全部松开」（设计文档 §5.2，方案 B）。
+    /// 没有这个集合，钩子无法区分「用户按了第一个键」与「用户按完了整组键」——
+    /// 旧实现正是把任意一次 key-down 当完成，导致组合键第一下就被截断。
+    /// </para>
+    /// <para>
+    /// 顺序无关（绑定的语义是「同时按」），故用 <see cref="List{T}"/> 而非有序结构；
+    /// 容量按人手最多同时按住的键数预分配，录制期不产生扩容分配。
+    /// </para>
+    /// </summary>
+    private readonly List<PhysicalKey> _recordedKeys = new(8);
+
     /// <summary>录制产出的信号（无捕获时不置位、不空转）。</summary>
     private readonly AutoResetEvent _captureSignal = new(false);
 
     /// <summary>
-    /// 录制到的那一次按键（回调线程写、等待线程读；靠 <see cref="_captureSignal"/> 建立先行关系）。
-    /// </summary>
-    private readonly record struct CaptureEvent(PhysicalKey Key, string[] ModifierFamilies)
-    {
-        /// <summary>
-        /// 主键：本次录到的物理键里挑一个“非修饰键”；全为修饰键时才退回自身。
-        ///
-        /// <para>
-        /// 场景：用户把 Ctrl+Shift 录成一个开关组合——修饰族是 {Ctrl, Shift}，而“录到的那一下”
-        /// 是后松开的 Shift。主键应取 Ctrl（先按下的那个、也是描述里的头一个），
-        /// 与 <c>KeyCatalog</c> 的固定序（Ctrl→Alt→Shift→Win）口径一致。
-        /// </para>
-        /// </summary>
-        public PhysicalKey PrimaryKey()
-        {
-            // 鼠标键没有修饰键族概念（组合形态仅键盘），直接就是它自己。
-            if (Key.IsMouse)
-            {
-                return Key;
-            }
-
-            // 修饰族名与 KeyCatalog 用的是同一批字符串（Ctrl / Alt / Shift / Win）。
-            // 取族的代表键（左侧那个）——族名不是虚拟键码，不能直接喂给
-            // RepresentativeOfFamily（它只认键，遇到未知族名会原样返回，得到错误的主键）。
-            foreach (var family in ModifierFamilies)
-            {
-                var keys = KeyCatalog.KeysOfFamily(family);
-                if (keys.Count > 0)
-                {
-                    return PhysicalKey.FromKeyboard(KeyCatalog.RepresentativeOfFamily(keys[0]));
-                }
-            }
-
-            return Key;
-        }
-    }
-
-    /// <summary>
-    /// 录制产出的一次按键：物理键 + 主键 + 已归一的修饰键族集合。
+    /// 录制产出的一次捕获（回调线程写、等待线程读；靠 <see cref="_captureSignal"/> 建立先行关系）。
     ///
     /// <para>
-    /// <b>为何把“主键”与“族集合”都给出</b>：主键是编辑页「主键」下拉的预选值
-    /// （FR-TOGGLE-05 的占用判定按主键，不区分修饰键）；族集合交给上层用 <c>KeyCatalog</c>
-    /// 重算落盘形状（固定序描述、修饰键集合），编辑页不必自己猜。
+    /// 载荷是**用户按下的整个键集合**（已全部松开——见 <see cref="_recordedKeys"/> 与设计文档 §5.2），
+    /// 不是「最后那一下」。集合里可能全是修饰键（录 <c>Ctrl+Shift</c> 就是），
+    /// 故本类型**不预判主键**——「哪个当主键」是 UI 层按 <c>KeyCatalog</c> 拆分的职责。
+    /// </para>
+    /// </summary>
+    private readonly record struct CaptureEvent(PhysicalKey[] Keys);
+
+    /// <summary>
+    /// 录制产出的一次捕获：用户按下的整个键集合（设计文档 §5.2，方案 B）。
+    ///
+    /// <para>
+    /// <b>为何给集合而不是「主键 + 族集合」</b>：按住集合里哪些是修饰键、哪个当主键，
+    /// 要由 <c>KeyCatalog</c> 判定，而那是**上层**的知识（本类只认物理键）。
+    /// 由上层从集合现场拆分，也让「录纯修饰键组合」这一情形自然成立——
+    /// 旧形态（单主键 + 族集合）表达不了「集合里没有非修饰键」。
     /// </para>
     /// <para>
     /// <b>为何不在这里直接给 <c>KeyBinding</c></b>：本类（Input 层）不认识任务模型与落盘契约，
     /// 它的产出只到今天这一层为止（Ui → Engine → Input）。
     /// </para>
     /// </summary>
-    public readonly record struct CapturedKeyEvent(PhysicalKey Key, PhysicalKey PrimaryKey, string[] ModifierFamilies);
+    public readonly record struct CapturedKeyEvent(PhysicalKey[] Keys);
 
     // ── 生命周期 ────────────────────────────────────────────────
 
@@ -248,12 +237,19 @@ internal sealed class HookService : IDisposable
     private static readonly TimeSpan PeriodicReinstallInterval = TimeSpan.FromMinutes(5);
 
     /// <summary>
-    /// 开关事件（回调 → 投递线程的载荷）。用只读结构体而非元组，避免装箱与顺序误读。
+    /// 开关/紧急停止事件（回调 → 投递线程的载荷）。用只读结构体而非元组，避免装箱与顺序误读。
+    ///
+    /// <para>
+    /// <b><paramref name="TaskId"/> 为 <c>null</c> 即“紧急停止”</b>（设计文档 §3.5.2）：
+    /// 载荷用可空任务 Id 单字段承担归属，而不是“枚举 + Guid”双字段——
+    /// 后者存在非法组合（紧急停止却带任务 Id、开关却无任务 Id 的中间态），
+    /// 每个消费点都得处理“两个字段彼此矛盾”的情形，而这类情形在正确实现里永不发生。
+    /// </para>
     /// </summary>
-    private readonly record struct ToggleEvent(PhysicalKey Key, bool IsKeyDown, string[] ModifierFamilies);
+    private readonly record struct ToggleEvent(PhysicalKey Key, bool IsKeyDown, string[] ModifierFamilies, Guid? TaskId);
 
     /// <summary>
-    /// 某开关键被点按（按下或松开都会各抛一次）。
+    /// 某开关按键或**紧急停止快捷键**被点按。
     ///
     /// <para>
     /// <b>不在回调线程上抛出</b>：订阅方会做启停任务之类的实事，若直接在钩子回调里调用，
@@ -261,8 +257,10 @@ internal sealed class HookService : IDisposable
     /// 投递线程抛出。
     /// </para>
     /// <para>
-    /// 第二参数：<c>true</c> = 按下，<c>false</c> = 松开。上层据此决定"点按"的语义
-    /// （点按通常在松开的瞬间成立——见设计文档 §3.4「点火语义」）。
+    /// 第二参数：<c>true</c> = 按下，<c>false</c> = 松开。上层据此决定“点按”的语义
+    /// （点按通常在松开的瞬间成立——见设计文档 §3.4「点火语义」）；
+    /// <b>紧急停止只认按下</b>（§3.5.3）——它是保险丝，按下即应动作，
+    /// 等松开意味着“松手前一直在跑”，那是用户按下它的全过程。
     /// </para>
     /// <para>
     /// 第三参数：事件在回调侧当场命中的**修饰键族名集合**（Ctrl / Alt / Shift / Win，已归一），
@@ -270,10 +268,15 @@ internal sealed class HookService : IDisposable
     /// 若订阅方到投递线程再读钩子的修饰键状态，那个状态可能已被后续按键改掉——
     /// 因此命中时的族集合必须在<b>回调线程当场取快照</b>并随事件带走（见 §3.4.1 组合命中）。
     /// 订阅方（Engine）据此重算命中任务 Id；钩子侧**不**做任务归属判定，
-    /// 保持"低层输入层不认识任务模型"的分层（Ui → Engine → Input）。
+    /// 保持“低层输入层不认识任务模型”的分层（Ui → Engine → Input）。
+    /// </para>
+    /// <para>
+    /// 第四参数：**归属标识**——<c>null</c> = 紧急停止（停止全部运行中任务），
+    /// 非 <c>null</c> = 该开关所属任务 Id（设计文档 §3.5.2）。
+    /// 承载：由 <see cref="RouteToggle"/> 在回调侧一次判定后写入，上层据此分流。
     /// </para>
     /// </summary>
-    public event Action<PhysicalKey, bool, string[]>? ToggleRequested;
+    public event Action<PhysicalKey, bool, string[], Guid?>? ToggleRequested;
 
     /// <summary>
     /// 构造。不做任何系统调用、不建线程——资源在 <see cref="Start"/> 时创建。
@@ -395,7 +398,8 @@ internal sealed class HookService : IDisposable
     /// 用户「取消录制」与 UI 关闭都调它；<see cref="Stop"/> / <see cref="Dispose"/> 内部也调
     /// （否则钩子停了、录制态还开着，界面就会干等一个永远不来的按键）。
     /// </para>
-    /// <para>幂等：不在录制态时是空操作。**保留已捕获的结果**——取消针对的是「还没捕获到」。
+    /// <para>
+    /// 幂等：不在录制态时是空操作。**保留已捕获的结果**——取消针对的是「还没捕获到」。
     /// </para>
     /// </summary>
     public void CancelCapture()
@@ -406,6 +410,12 @@ internal sealed class HookService : IDisposable
             _recording = false;
             _captureSignal.Set();
         }
+
+        // 清掉未闭合的按下集合。**必须在 _recording 之外**，不能只写在 if 里：
+        // 取消与最后一下松开可能擦肩——等待方已取走结果（_recording 落地为 false）、
+        // 但松开与 Cancel 的先后不定，残留的键不清就会带到下一次录制，
+        // 让新会话一开始就“已经有键按着了”（设计文档 §5.2 要求会话之间不串）。
+        _recordedKeys.Clear();
     }
 
     /// <summary>
@@ -420,9 +430,14 @@ internal sealed class HookService : IDisposable
         _capturedEvent = null;
         _recording = false;
 
+        // 未闭合的按下集合一并清掉：走到这里要么已有结果（集合本就空——判空时才置的信号），
+        // 要么是取消/超时（那一路由 CancelCapture 清）。这里再清一次是给
+        // “结果与集合同帧出发”的情形兜底，保证下一次录制从空集合开始。
+        _recordedKeys.Clear();
+
         // 信号在无结果时被置位（例如取消与捕获撞在一起）：返回空，不把脏状态带出去。
         return captured is { } value
-            ? new CapturedKeyEvent(value.Key, value.PrimaryKey(), value.ModifierFamilies)
+            ? new CapturedKeyEvent(value.Keys)
             : null;
     }
 
@@ -838,8 +853,7 @@ internal sealed class HookService : IDisposable
     /// <summary>
     /// 维护"当前按下的修饰键族集合"（仅键盘路径调用，见 <see cref="_pressedModifierFamilies"/>）。
     ///
-    /// <para>
-    /// 非修饰键直接返回——它们不参与组合前置条件。族名由
+    /// <para>非修饰键直接返回——它们不参与组合前置条件。族名由
     /// <see cref="KeyCatalog.ModifierFamily"/> 给出（已含左右归一），故左右 Ctrl 统一计入 "Ctrl"。
     /// </para>
     /// <para>
@@ -1035,9 +1049,9 @@ internal sealed class HookService : IDisposable
     /// ③ 置一个 AutoResetEvent 叫醒等待方——置信号不阻塞、不分配。
     /// </para>
     /// <para>
-    /// <b>为什么捕获事件声明要留在回调线程</b>：键是「按下的那一下」才成立，
-    /// 松开的捕获会把主键收到松开事件上；而且交给别的线程就得多一份待处理的键，又回到分配上。
-    /// 回调线程是按键事件的天然序列化点，在这里一次定态最自然。
+    /// <b>为什么捕获事件声明要留在回调线程</b>：整个按下集合在哪个时刻「凑齐」只有回调线程知道
+    /// （它是按键事件的天然序列化点，见 <see cref="_recordedKeys"/>）；交给别的线程就得多一份
+    /// 待处理的集合，又回到分配与同步上。
     /// </para>
     /// <para>
     /// <b>为什么只置信号、由等待方自己清标志</b>：本方法与 <see cref="CancelCapture"/>
@@ -1046,35 +1060,65 @@ internal sealed class HookService : IDisposable
     /// 录制态却开着」的黑洞，UI 永远等不到结果。故只有取消方负责清，捕获方只置信号，
     /// 等待方醒来后无条件清——三处各自单写、无竞态。
     /// </para>
+    /// <para>
+    /// <b>进出规则的唯一载体是 <see cref="_recordedKeys"/></b>：按下入集合并吞掉，
+    /// 松开出集合后<em>再</em>判空——集合空 = 用户的整组键都松了 = 这一组键按完了。
+    /// 完成时把集合**快照一份**交出去（<c>ToArray</c>），因为紧接着的 <c>CancelCapture</c>
+    /// 会清空集合，若直接交引用，等待方拿到的可能是被清空后的同一份。
+    /// </para>
     /// </summary>
-    /// <returns>一律「吞掉」：录制期的按键是用户的配置动作，不应落到别的窗口去。</returns>
+    /// <returns>
+    /// 按下：一律「吞掉」（录制期的按键是用户的配置动作，不应落到别的窗口去）。
+    /// 松开：一律「放行」——若连同松开一起吞，系统里就会残留「按下被吃掉、松开却到了」的半截键，
+    /// 前台程序收到的状态与它自己发出的不一致（设计文档 §5.2）。
+    /// </returns>
     private IntPtr Capture(PhysicalKey key, bool isKeyDown, int nCode, IntPtr wParam, IntPtr lParam)
     {
-        if (!isKeyDown)
+        if (isKeyDown)
         {
-            // 只认按下：若把松开当捕获结果，用户按住不放会产生两个事件，先到的那个反而会被丢掉
-            // （AutoResetEvent 只记得一次信号）。放行松开不吞：录制的是一次按下，松开无关位。
+            // 同一键重复按下（系统自动重复）只记一次：集合是「哪些键按着」，不是「按了几下」。
+            if (!_recordedKeys.Contains(key))
+            {
+                _recordedKeys.Add(key);
+            }
+
+            // 按下不产生结果——用户可能还要接着按第二个、第三个键。
+            // 这正是旧实现出错的地方：它在这里就上报并置信号，组合键第一下就被截断。
+            return new IntPtr(1);
+        }
+
+        _recordedKeys.Remove(key);
+
+        // 还有键按着：这一组还没按完，继续等。
+        if (_recordedKeys.Count > 0)
+        {
             return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
         }
 
-        // 当场取修饰键族集合（与开关事件同口径）：鼠标路径无修饰键族概念，给空数组。
-        var families = key.IsKeyboard ? SnapshotModifierFamilies() : Array.Empty<string>();
-        _capturedEvent = new CaptureEvent(key, families);
+        // 集合清空 = 完成。此时一定至少按过一个键（能走到这里说明刚才那个键在集合里），
+        // 故不必再判空集合。快照一份交出去，避免与 CancelCapture 的清空赛跑。
+        _capturedEvent = new CaptureEvent(_recordedKeys.ToArray());
         _captureSignal.Set();
 
-        return new IntPtr(1);
+        return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
     }
 
     /// <summary>
-    /// 共用的判定与分发：查快照 → 命中则入队 → 按消费口径决定"吞掉 / 照常"。
+    /// 键盘与鼠标两条回调路径共用的判定与分发：查快照 → 命中则入队 → 按消费口径决定“吞掉 / 照常”。
     ///
     /// <para>
-    /// 入队与返回值**互不影响**：入队是"通知上层"，返回值是"是否放行本次事件"。
-    /// 无论吞或不吞，命中的开关键都要通知上层——否则"配了吞掉"的任务永远收不到开关信号。
+    /// 入队与返回值**互不影响**：入队是“通知上层”，返回值是“是否放行本次事件”。
+    /// 无论吞或不吞，命中的开关键都要通知上层——否则“配了吞掉”的任务永远收不到开关信号。
     /// </para>
     /// <para>
     /// <paramref name="isKeyboard"/> 决定查表口径：键盘走组合判定（修饰键族集合必须全部按下），
     /// 鼠标走单键判定（鼠标键没有修饰键族概念，见 §3.4.1）。
+    /// </para>
+    /// <para>
+    /// <b>两类命中</b>（设计文档 §3.5）：任务开关（<c>TaskId</c> = 任务 Id，松手时成立，可吞）
+    /// 与紧急停止（<c>TaskId</c> = <c>null</c>，按下即成立，不吞）。两者共用一条入队通道，
+    /// 靠载荷里的 <c>TaskId</c> 区分——不新增事件、不新增队列，也就不会出现
+    /// “两条通道各自维护开关状态、彼此不一致”的情形。
     /// </para>
     /// </summary>
     private IntPtr RouteToggle(PhysicalKey key, bool isKeyDown, int nCode, IntPtr wParam, IntPtr lParam, bool isKeyboard)
@@ -1088,7 +1132,16 @@ internal sealed class HookService : IDisposable
             ? snapshot.TryGetConsume(key, _pressedModifierFamilies.Keys, out var consume)
             : snapshot.TryGetConsume(key, out consume);
 
-        if (!hit)
+        // 紧急停止判定（设计文档 §3.5.3）。查表顺序：先开关键——
+        // 两张表同主键时构建期已把开关键那条排除掉（§3.5.4），
+        // 但那只防手改坏的配置；正常配置下两表互斥，顺序不影响结果。
+        // 紧急停止**只认按下**：它是保险丝，按下即应动作；松开不重复触发。
+        // 鼠标键不参与——紧急停止是键盘快捷键（AppSettings.EmergencyStopKey 的形态）。
+        var isEmergencyStop = isKeyboard
+            && isKeyDown
+            && snapshot.IsEmergencyStop(key, _pressedModifierFamilies.Keys);
+
+        if (!hit && !isEmergencyStop)
         {
             return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
         }
@@ -1099,12 +1152,59 @@ internal sealed class HookService : IDisposable
             ? SnapshotModifierFamilies()
             : Array.Empty<string>();
 
-        _pending.Enqueue(new ToggleEvent(key, isKeyDown, families));
+        // 归属标识：紧急停止 = null，开关键 = 该键此刻命中的任务 Id（§3.5.2）。
+        // 任务 Id 在**回调侧**算定而非投递线程：修饰键状态只在本线程维护，
+        // 到了投递线程再下结论可能用已变的状态查错任务。
+        // 两者同时命中（防御：手改配置）时**紧急停止优先**——保险丝不可被开关抢走。
+        Guid? taskId = isEmergencyStop
+            ? null
+            : ResolveToggleTaskId(snapshot, key, families, isKeyboard);
+
+        _pending.Enqueue(new ToggleEvent(key, isKeyDown, families, taskId));
         _deliverySignal.Set();
 
         // §3.4：吞掉 = 非零返回且不调 CallNextHookEx（事件到此为止，后面的钩子与
         // 目标窗口都收不到）；照常 = 调 CallNextHookEx 并返回它的返回值（保持钩子链约定）。
+        // §3.5.5：紧急停止**不吞**原始输入（写死不可配）——它不该改变用户正在做的输入
+        // （与任务开关不同，后者可能注定要吞，否则被 Ctrl 类快捷键抢键），
+        // 而保险丝在任何情况下都要先能不费力地按下去。
+        if (isEmergencyStop)
+        {
+            return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+        }
+
         return consume ? new IntPtr(1) : CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+    }
+
+    /// <summary>
+    /// 开关键的任务归属解析（设计文档 §5.4 方案 A）：命中开关键时算出它属于哪个任务。
+    ///
+    /// <para>
+    /// <b>不区分按下 / 松开</b>：本方法只回答“这个键此刻命中哪个任务”，**时间口径不归它管**。
+    /// 按下与松开两个事件都要带着同一个任务 Id 交给门面，由门面按 §3.5.3 分发
+    /// （任务开关只认松开：门面用 <c>if (isKeyDown) return;</c> 丢掉按下那次事件）。
+    /// 若在这里按 <c>isKeyDown</c> 过滤，松开事件就会带着 <c>null</c> 出去，
+    /// 而 <c>null</c> 的语义是**紧急停止**（§3.5.2），门面会把一次普通开关误当成保险丝。
+    /// </para>
+    /// <para>
+    /// <b>不命中任务时返回 <c>null</c></b>——但上层**不能**把 <c>null</c> 一律当成紧急停止：
+    /// 本方法的 <c>null</c> 表示“这条事件确实不是任务开关”，而 <see cref="RouteToggle"/>
+    /// 已用 <c>isEmergencyStop</c> 先判过了。两处的 <c>null</c> 语义不同、不可混用，
+    /// 所以上层仍靠“事件是不是紧急停止”分流，而非靠“TaskId 是不是 null”。
+    /// </para>
+    /// </summary>
+    private static Guid? ResolveToggleTaskId(
+        ToggleSnapshot snapshot,
+        PhysicalKey key,
+        string[] families,
+        bool isKeyboard)
+    {
+        // 鼠标键条目无修饰键族概念，走单键口径（§3.4.1）。
+        var resolved = isKeyboard
+            ? snapshot.TryGetTaskId(key, families, out var taskId)
+            : snapshot.TryGetTaskId(key, null, out taskId);
+
+        return resolved ? taskId : null;
     }
 
     /// <summary>把鼠标消息映射为鼠标键（不涉及任何"自创映射表"——就是 Win32 消息本身的语义）。</summary>
@@ -1215,16 +1315,24 @@ internal sealed class HookService : IDisposable
         var handler = ToggleRequested;
         if (handler is null)
         {
+            // 无订阅者：事件到此为止，但**不得静默**（设计文档 §3.5.6）。
+            // 这条分支曾是裸 return：没有订阅者时开关与紧急停止都像“没接上线”一样安静，
+            // 而“保险丝按下去没反应”与“保险丝没装”在外部表现完全相同（都是无任何反馈），
+            // 排查时无法区分是没订阅、还是订阅了但没命中、还是命中了但被吞了。
+            // 加一行调试输出零成本：正常路径（已订阅）不付这个钱，异常路径至少留下痕迹。
+            System.Diagnostics.Debug.WriteLine(
+                $"[HookService] 开关事件无订阅者，已丢弃：key={item.Key}, down={item.IsKeyDown}, taskId={item.TaskId?.ToString() ?? "<紧急停止>"}");
             return;
         }
 
         try
         {
-            handler(item.Key, item.IsKeyDown, item.ModifierFamilies);
+            handler(item.Key, item.IsKeyDown, item.ModifierFamilies, item.TaskId);
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"[HookService] 开关事件订阅方抛出异常：{ex}");
+            System.Diagnostics.Debug.WriteLine(
+                $"[HookService] 开关事件订阅方抛出异常（key={item.Key}, taskId={item.TaskId?.ToString() ?? "<紧急停止>"}）：{ex}");
         }
     }
 

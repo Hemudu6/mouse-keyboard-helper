@@ -245,6 +245,11 @@ public sealed class JsonConfigStore : IConfigStore
     }
 
     /// <inheritdoc />
+    /// <remarks>
+    /// 成功时经由 <see cref="ConfigSaveResult.Ok"/> 回传**实际落盘的那份设置**（<see cref="ConfigSaveResult.Value"/>）：
+    /// 写入前会补上缺失的字段（<c>SchemaVersion</c> 取当前版本；入参为 <c>null</c> 时
+    /// 整个换成默认设置）——内存若继续拿着入参，就与磁盘上的那份不是同一份了。
+    /// </remarks>
     public ConfigSaveResult SaveSettings(AppSettings settings)
     {
         var document = new SettingsConfigDocument
@@ -253,7 +258,7 @@ public sealed class JsonConfigStore : IConfigStore
             Settings = settings ?? new AppSettings(),
         };
 
-        return WriteFile(SettingsFilePath, document);
+        return WriteFile(SettingsFilePath, document, document.Settings);
     }
 
     /// <summary>
@@ -265,7 +270,7 @@ public sealed class JsonConfigStore : IConfigStore
     /// 失败时清理临时文件：留着会在配置目录里堆垃圾，
     /// 且它的名字带有误导性（看似配置的一部分）。
     /// </summary>
-    private ConfigSaveResult WriteFile<T>(string path, T document)
+    private ConfigSaveResult WriteFile<T>(string path, T document, AppSettings? savedSettings = null)
     {
         string? tempPath = null;
         try
@@ -294,7 +299,7 @@ public sealed class JsonConfigStore : IConfigStore
 
             // 替换成功后临时文件已不存在（被移动/替换掉了），无需清理。
             tempPath = null;
-            return ConfigSaveResult.Ok;
+            return ConfigSaveResult.Ok(savedSettings);
         }
         catch (Exception ex)
         {

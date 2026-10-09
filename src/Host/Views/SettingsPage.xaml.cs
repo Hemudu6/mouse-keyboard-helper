@@ -128,6 +128,8 @@ public sealed partial class SettingsPage : Page
 
         if (captured is not { } keyEvent)
         {
+            // 超时取消 / 用户中途改主意。等下一次重新捕获时兜底，见设计文档 §5.2 的键集合纪律。
+            _facade.Hooks.CancelCapture();
             await ShowMessage("未捕获到按键", "等待超时（5 秒）。请重新点击「捕获按键」。");
             return;
         }
@@ -160,32 +162,123 @@ public sealed partial class SettingsPage : Page
         ShowEmergencyStopKey();
     }
 
+    /// <summary>
+    /// 把钩子给出的按下集合折算成绑定（修饰族固定序：Ctrl → Alt → Shift → Win）。
+    ///
+    /// <para>
+    /// 判定口径（设计文档 §5.2，方案 B）：集合里**属于修饰键族的键进修饰键**，
+    /// 其余键里挑一个当主键；全为修饰键时（用户就录了 Ctrl+Shift）不挑主键，
+    /// 从集合里的修饰键中取一个当主键——只有这样绑定才表达得出来。
+    /// </para>
+    /// </summary>
     private static KeyBinding BuildBinding(HookService.CapturedKeyEvent keyEvent)
     {
-        var modifiers = new List<WpfKey>();
-        foreach (var family in keyEvent.ModifierFamilies)
+        // 先挑主键（口径见 PickMainKey）：修饰键优先取族代表键，一个修饰键都没有才取集合首键。
+        // 与用户按下顺序无关——顺序无意义，绑定语义是「同时按」。
+        var mainKey = PickMainKey(keyEvent.Keys);
+        if (keyEvent.Keys.Length < 2)
         {
-            foreach (var modifier in KeyCatalog.KeysOfFamily(family))
+            // 集合只有 1 个键（或空）时**只有主键**，没有"其余键"可进修饰集。
+            // 这一步不是优化，是正确性：若把主键也算进"其余键"，裸键绑定会变成
+            // 「主键 F6 + 修饰集 [F6]」——同一个键既当主键又当修饰条件，
+            // 任何正常录制路径都产不出来，读起来也无法解释。
+            return mainKey.Mouse is { } singleMouseKey
+                ? KeyBinding.FromMouse(singleMouseKey)
+                : KeyBinding.FromKey(
+                    mainKey.KeyboardVirtualKey
+                        ?? throw new InvalidOperationException(
+                            "捕获到的紧急停止键既不是键盘键也不是鼠标键，无法构造绑定。"));
+        }
+
+        if (mainKey.Mouse is { } mouseKey)
+        {
+            // 鼠标键的 KeyboardVirtualKey 为 null，直接取它就是崩。这里按鼠标单键形态绑定，
+            // 让下游 HotKeyProbe 拿到 binding.MainKey == null 后走"鼠标键不能作系统热键"的分支——
+            // 那条分支正是为此存在的（见 HotKeyProbe.TryProbe）。
+            return KeyBinding.FromMouse(mouseKey);
+        }
+
+        var virtualKey = mainKey.KeyboardVirtualKey
+            ?? throw new InvalidOperationException(
+                "捕获到的紧急停止键既不是键盘键也不是鼠标键，无法构造绑定。");
+
+        var modifiers = CollectModifiers(keyEvent.Keys, mainKey);
+        return modifiers.Count == 0
+            ? KeyBinding.FromKey(virtualKey)
+            : KeyBinding.FromCombo(modifiers, virtualKey);
+    }
+
+    /// <summary>修饰键族的固定序（与设计文档 §3.4 的组合命中顺序一致）。</summary>
+    private static readonly string[] FamilyOrder = { "Ctrl", "Alt", "Shift", "Win" };
+
+    /// <summary>
+    /// 从捕获到的按下集合里挑主键：**修饰键优先**——
+    /// 按固定族序（Ctrl→Alt→Shift→Win）取第一个命中的修饰键**族代表键**；
+    /// 集合里一个修饰键也没有时取 `keys[0]`。
+    ///
+    /// <para>
+    /// <b>为什么修饰键优先而不是"用户按的第一个键"</b>：主键是下游判等的键——
+    /// 快照的 <c>ToggleSnapshot.Normalize</c> 与任务校验的 <c>ModifierFamilies</c>
+    /// 都按**族代表键**归一（左右 Ctrl 视为同族）。若拿用户实按的那把（可能是右 Ctrl）当主键，
+    /// 与族代表键比对会**查不中**，于是"钩子命中了、引擎却找不到任务"。
+    /// 取族代表键即与归一口径一致。
+    /// </para>
+    /// <para>
+    /// <b>派生形态对照</b>：<c>Ctrl+K</c> → 主键 Ctrl、修饰集 <c>[K]</c>；
+    /// <c>Ctrl+Shift</c> → 主键 Ctrl、修饰集 <c>[Shift]</c>（见 <see cref="CollectModifiers"/>）；
+    /// <c>F6</c> → 主键 F6、修饰集空（单键形态）。
+    /// </para>
+    /// </summary>
+    private static PhysicalKey PickMainKey(IReadOnlyList<PhysicalKey> keys)
+    {
+        foreach (var family in FamilyOrder)
+        {
+            foreach (var key in KeyCatalog.KeysOfFamily(family))
             {
-                modifiers.Add(modifier);
+                foreach (var pressed in keys)
+                {
+                    if (pressed.KeyboardVirtualKey == key)
+                    {
+                        return pressed;
+                    }
+                }
+            }
+        }
+
+        return keys[0];
+    }
+
+    /// <summary>
+    /// 把按下集合里其余的修饰键折成绑定用的修饰键列表：每族**至多一个代表键**
+    /// （左右归一，见 KeyCatalog），按固定族序排列。
+    ///
+    /// <para>
+    /// 主键本身即使是个修饰键也不再重复进列表（它已经是主键了）。
+    /// </para>
+    /// </summary>
+    private static List<WpfKey> CollectModifiers(IReadOnlyList<PhysicalKey> keys, PhysicalKey mainKey)
+    {
+        var modifiers = new List<WpfKey>();
+        foreach (var family in FamilyOrder)
+        {
+            foreach (var pressed in keys)
+            {
+                if (pressed == mainKey || pressed.KeyboardVirtualKey is not { } virtualKey)
+                {
+                    continue;
+                }
+
+                if (KeyCatalog.ModifierFamily(virtualKey) != family)
+                {
+                    continue;
+                }
+
+                modifiers.Add(KeyCatalog.RepresentativeOfFamily(virtualKey));
                 break; // 每族一个代表键（修饰键按族归一）。
             }
         }
 
-        // 鼠标键的 KeyboardVirtualKey 为 null，直接取它就是崩。这里按鼠标单键形态绑定，
-        // 让下游 HotKeyProbe 拿到 binding.MainKey == null 后走"鼠标键不能作系统热键"的分支——
-        // 那条分支正是为此存在的（见 HotKeyProbe.TryProbe）。
-        if (keyEvent.PrimaryKey.Mouse is { } mouseKey)
-        {
-            return KeyBinding.FromMouse(mouseKey);
-        }
-
-        var mainKey = keyEvent.PrimaryKey.KeyboardVirtualKey
-            ?? throw new InvalidOperationException(
-                "捕获到的紧急停止键既不是键盘键也不是鼠标键，无法构造绑定。");
-        return modifiers.Count == 0
-            ? KeyBinding.FromKey(mainKey)
-            : KeyBinding.FromCombo(modifiers, mainKey);
+        return modifiers;
     }
 
     private void ShowEmergencyStopKey()
@@ -195,6 +288,10 @@ public sealed partial class SettingsPage : Page
 
     private async void OnSaveClick(object sender, RoutedEventArgs e)
     {
+        // 落盘 + 应急停止键生效（含）由门面一次做完（§3.5.4）：
+        // SaveSettings 成功时会在内部重建并重推快照，本页**不必**也不能再推一次——
+        // 快照构建依赖任务列表与设置的全局视图，那是 Engine 的职责，
+        // UI 重推会多走一次构建、且容易与门面内部的状态脱节（§6.5.1 单向推送）。
         var result = _facade.SaveSettings(_settings);
         if (!result.Succeeded)
         {

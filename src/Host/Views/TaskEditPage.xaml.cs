@@ -174,6 +174,8 @@ public sealed partial class TaskEditPage : Page
         if (captured is not { } keyEvent)
         {
             // 超时或被取消——两者对用户是同一件事：没抓到，请重试。
+            // 关键：录制态就此作废，否则下一次捕获会与这次残留的状态串在一起。
+            _facade.Hooks.CancelCapture();
             _capturing = false;
             CaptureToggleKeyButton.IsEnabled = true;
             ToggleKeyRing.IsActive = false;
@@ -193,9 +195,9 @@ public sealed partial class TaskEditPage : Page
         //
         // **鼠标键除外**：交互拦截只由键盘钩子实施（§3.4 组合命中判定亦仅键盘），
         // 鼠标键的原始输入不经过它，故"会被拦截"对鼠标键不成立；
-        // 而钩子侧对鼠标不维护修饰键族集合（ModifierFamilies 恒为空，见 BuildBinding），
+        // 而钩子侧对鼠标不维护修饰键族集合（见 BuildBinding），
         // 不加这道守卫的话，任何一个鼠标单键都会命中下面这个分支、弹出与事实不符的提示。
-        if (keyEvent.ModifierFamilies.Length == 0 && keyEvent.PrimaryKey.Mouse is null)
+        if (keyEvent.Keys.Length < 2 && PickMainKey(keyEvent.Keys).Mouse is null)
         {
             BareKeyHintBar.Message =
                 $"「{KeyCatalog.Describe(_draft.ToggleKey)}」不含修饰键，"
@@ -225,34 +227,123 @@ public sealed partial class TaskEditPage : Page
         ShowToggleKey();
     }
 
-    /// <summary>把钩子给出的捕获事件折算成绑定（修饰族固定序：Ctrl → Alt → Shift → Win）。</summary>
+    /// <summary>
+    /// 把钩子给出的按下集合折算成绑定（修饰族固定序：Ctrl → Alt → Shift → Win）。
+    ///
+    /// <para>
+    /// <b>与设置页的 <c>BuildBinding</c> 是逐字副本</b>：两页的录制语义必须一致——
+    /// 同一组按键在任务开关键与紧急停止键那里得不到同一个绑定，是用户无法理解的分歧。
+    /// 改一必改二。
+    /// </para>
+    /// </summary>
     private static KeyBinding BuildBinding(HookService.CapturedKeyEvent keyEvent)
     {
-        var modifiers = new List<WpfKey>();
-        foreach (var family in keyEvent.ModifierFamilies)
+        // 先挑主键（口径见 PickMainKey）：修饰键优先取族代表键，一个修饰键都没有才取集合首键。
+        // 与用户按下顺序无关——顺序无意义，绑定语义是「同时按」。
+        var mainKey = PickMainKey(keyEvent.Keys);
+        if (keyEvent.Keys.Length < 2)
         {
-            foreach (var modifier in KeyCatalog.KeysOfFamily(family))
-            {
-                modifiers.Add(modifier);
-                break; // 每族取一个代表键即可（修饰键按族归一，见 KeyCatalog）。
-            }
+            // 集合只有 1 个键（或空）时**只有主键**，没有"其余键"可进修饰集。
+            // 这一步不是优化，是正确性：若把主键也算进"其余键"，裸键绑定会变成
+            // 「主键 F6 + 修饰集 [F6]」——同一个键既当主键又当修饰条件，
+            // 任何正常录制路径都产不出来，读起来也无法解释。
+            return mainKey.Mouse is { } singleMouseKey
+                ? KeyBinding.FromMouse(singleMouseKey)
+                : KeyBinding.FromKey(
+                    mainKey.KeyboardVirtualKey
+                        ?? throw new InvalidOperationException(
+                            "捕获到的开关键既不是键盘键也不是鼠标键，无法构造绑定。"));
         }
 
         // 鼠标键：组合形态仅键盘（§3.4 组合命中判定），故鼠标键不参与组合；
-        // 钩子侧对鼠标也不维护修饰键族集合（HookService 中鼠标版 ModifierFamilies 恒为空）。
-        // 因此直接按"鼠标单键"形态绑定。
+        // 钩子侧对鼠标也不维护修饰键族集合。因此直接按"鼠标单键"形态绑定。
         // 这里**不能**走 KeyboardVirtualKey：鼠标键的该字段为 null，取它就是崩。
-        if (keyEvent.PrimaryKey.Mouse is { } mouseKey)
+        if (mainKey.Mouse is { } mouseKey)
         {
             return KeyBinding.FromMouse(mouseKey);
         }
 
-        var mainKey = keyEvent.PrimaryKey.KeyboardVirtualKey
+        var virtualKey = mainKey.KeyboardVirtualKey
             ?? throw new InvalidOperationException(
                 "捕获到的开关键既不是键盘键也不是鼠标键，无法构造绑定。");
+
+        var modifiers = CollectModifiers(keyEvent.Keys, mainKey);
         return modifiers.Count == 0
-            ? KeyBinding.FromKey(mainKey)
-            : KeyBinding.FromCombo(modifiers, mainKey);
+            ? KeyBinding.FromKey(virtualKey)
+            : KeyBinding.FromCombo(modifiers, virtualKey);
+    }
+
+    /// <summary>修饰键族的固定序（与设计文档 §3.4 的组合命中顺序一致）。</summary>
+    private static readonly string[] FamilyOrder = { "Ctrl", "Alt", "Shift", "Win" };
+
+    /// <summary>
+    /// 从捕获到的按下集合里挑主键：**修饰键优先**——
+    /// 按固定族序（Ctrl→Alt→Shift→Win）取第一个命中的修饰键**族代表键**；
+    /// 集合里一个修饰键也没有时取 `keys[0]`。
+    ///
+    /// <para>
+    /// <b>为什么修饰键优先而不是"用户按的第一个键"</b>：主键是下游判等的键——
+    /// 快照的 <c>ToggleSnapshot.Normalize</c> 与任务校验的 <c>ModifierFamilies</c>
+    /// 都按**族代表键**归一（左右 Ctrl 视为同族）。若拿用户实按的那把（可能是右 Ctrl）当主键，
+    /// 与族代表键比对会**查不中**，于是"钩子命中了、引擎却找不到任务"。
+    /// 取族代表键即与归一口径一致。
+    /// </para>
+    /// <para>
+    /// <b>派生形态对照</b>：<c>Ctrl+K</c> → 主键 Ctrl、修饰集 <c>[K]</c>；
+    /// <c>Ctrl+Shift</c> → 主键 Ctrl、修饰集 <c>[Shift]</c>（见 <see cref="CollectModifiers"/>）；
+    /// <c>F6</c> → 主键 F6、修饰集空（单键形态）。
+    /// </para>
+    /// </summary>
+    private static PhysicalKey PickMainKey(IReadOnlyList<PhysicalKey> keys)
+    {
+        foreach (var family in FamilyOrder)
+        {
+            foreach (var key in KeyCatalog.KeysOfFamily(family))
+            {
+                foreach (var pressed in keys)
+                {
+                    if (pressed.KeyboardVirtualKey == key)
+                    {
+                        return pressed;
+                    }
+                }
+            }
+        }
+
+        return keys[0];
+    }
+
+    /// <summary>
+    /// 把按下集合里其余的修饰键折成绑定用的修饰键列表：每族**至多一个代表键**
+    /// （左右归一，见 KeyCatalog），按固定族序排列。
+    ///
+    /// <para>
+    /// 主键本身即使是个修饰键也不再重复进列表（它已经是主键了）。
+    /// </para>
+    /// </summary>
+    private static List<WpfKey> CollectModifiers(IReadOnlyList<PhysicalKey> keys, PhysicalKey mainKey)
+    {
+        var modifiers = new List<WpfKey>();
+        foreach (var family in FamilyOrder)
+        {
+            foreach (var pressed in keys)
+            {
+                if (pressed == mainKey || pressed.KeyboardVirtualKey is not { } virtualKey)
+                {
+                    continue;
+                }
+
+                if (KeyCatalog.ModifierFamily(virtualKey) != family)
+                {
+                    continue;
+                }
+
+                modifiers.Add(KeyCatalog.RepresentativeOfFamily(virtualKey));
+                break; // 每族一个代表键（修饰键按族归一）。
+            }
+        }
+
+        return modifiers;
     }
 
     private void ShowToggleKey() => ToggleKeyBox.Text = KeyCatalog.Describe(_draft.ToggleKey);

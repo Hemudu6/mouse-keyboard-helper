@@ -85,10 +85,18 @@ public sealed record KeyBinding
     /// <see cref="Modifiers"/> 的落盘桥接（设计文档 §7.1）。
     ///
     /// 把落盘形状固定成 JSON 数组，读出时再还原成集合——
-    /// 这样配置文件里就是人可读的 <c>"modifiers": ["Control"]</c>，
-    /// 而不是 STJ 对接口类型无从下手后抛出的异常。
+    /// 这样配置文件里就是一个数组，而不是 STJ 对接口类型无从下手后抛出的异常。
     ///
-    /// 读出时把 <c>null</c> 归一为空集（理由同 <see cref="Modifiers"/> 的 setter）。
+    /// <para>
+    /// 注意：落盘形态是 <see cref="Key"/> 的**数值**而非枚举名
+    /// （实测 <c>"modifiers": [118]</c> 即 <c>Key.LeftCtrl</c>）——
+    /// STJ 未挂 <c>JsonStringEnumConverter</c>，写成 <c>["LeftCtrl"]</c> 会直接抛。
+    /// </para>
+    ///
+    /// <para>
+    /// <c>init</c> 只在**输入非 null**时覆盖：<c>null</c>（含字段缺失）归一为空集，
+    /// 非空输入原样生效——故文件里真实存在的修饰集不会被落盘端写出的空数组反向掏空。
+    /// </para>
     /// </summary>
     [JsonPropertyName("modifiers")]
     public List<Key> ModifiersForJson
