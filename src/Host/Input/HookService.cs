@@ -127,7 +127,13 @@ internal sealed class HookService : IDisposable
     private CaptureEvent? _capturedEvent;
 
     /// <summary>
-    /// 录制期「已按下但尚未松开」的键集合（仅回调线程读写，无锁）。
+    /// 录制期「已按下但尚未松开」的键集合。
+    ///
+    /// <para>
+    /// <b>访问纪律</b>：它被两类线程碰——回调线程在中途 <c>Add</c>/<c>Remove</c>，
+    /// 取消方 / 取出方在另一线程 <c>Clear</c>。两者一律经 <see cref="_captureGate"/> 互斥。
+    /// 与之配套的并集见 <see cref="_pressedDuringCapture"/>：本集合管完成判据，并集管结果快照。
+    /// </para>
     ///
     /// <para>
     /// <b>为什么需要它</b>：捕获的完成判据是「已按下的键全部松开」（设计文档 §5.2，方案 B）。
@@ -140,6 +146,41 @@ internal sealed class HookService : IDisposable
     /// </para>
     /// </summary>
     private readonly List<PhysicalKey> _recordedKeys = new(8);
+
+    /// <summary>
+    /// 本次录制期间**按过的所有键**（并集，只增不减）。
+    ///
+    /// <para>
+    /// <b>与 <see cref="_recordedKeys"/> 的分工</b>：那个集合回答「此刻还按着哪些键」——只在松开判空时用，
+    /// 松开即移除；本集合回答「这一次录制用户总共按过哪些键」——只在产出结果时用，松开**不移除**。
+    /// 把两个语义塞进一个集合是旧实现的致命错误：完成判据要求「松开后集合为空」，
+    /// 而快照发生在最后一个键松开的那一刻，于是 <c>ToArray()</c> 永远得到空数组，
+    /// 捕获结果恒为空集（2026-10-09 实测日志实锤：H4 记到 `LeftCtrl`/`D2`，H5/H2 结果却是 0 键）。
+    /// </para>
+    /// <para>
+    /// 顺序无关（绑定的语义是「同时按」），用 <see cref="List{T}"/> 去重；
+    /// 容量按人手最多同时按住的键数预分配，录制期不产生扩容分配。
+    /// </para>
+    /// </summary>
+    private readonly List<PhysicalKey> _pressedDuringCapture = new(8);
+
+    /// <summary>
+    /// 两个录制集合的互斥闸（<see cref="_recordedKeys"/> / <see cref="_pressedDuringCapture"/>）。
+    ///
+    /// <para>
+    /// <b>为什么回调里取锁不算违规</b>：设计文档 §3.2 的「回调不取锁」，防的是**与任务调度/
+    /// 配置保存等长临界区争锁**——那样的锁一旦被持有一会儿，键盘就会卡。本锁保护的只是
+    /// 两个小集合的几次增删（无 IO、无分支回调、无分配），持有时间在纳秒量级，
+    /// 与「不 IO」同级的纪律（回调里本就有对账用的 Win32 调用）。
+    /// </para>
+    /// <para>
+    /// <b>不取锁会怎样</b>：取消方在另一线程 <c>Clear()</c> 一只 8 元素的 List，
+    /// 回调线程正在同一只 List 里 <c>Add</c>——<c>List&lt;T&gt;</c> 不是线程安全的，
+    /// 并发增删会损坏内部 <c>_size</c>/<c>_items</c>，最轻是丢键，最重是越界抛异常——
+    /// 而钩子回调里抛异常会直接被 CLR 终止进程（提权宿主，用户必须重新提权）。
+    /// </para>
+    /// </summary>
+    private readonly ReaderWriterLockSlim _captureGate = new(LockRecursionPolicy.NoRecursion);
 
     /// <summary>录制产出的信号（无捕获时不置位、不空转）。</summary>
     private readonly AutoResetEvent _captureSignal = new(false);
@@ -351,6 +392,20 @@ internal sealed class HookService : IDisposable
                 return false;
             }
 
+            // 开始录制也清零两个集合（设计文档 §5.2 的三个复位点：开始录制 / 取消录制 / 取出结果）。
+            // 与 CancelCapture 的入口判不同，这里已在锁内且确认此前未在录制，
+            // 故不会与在跑的会话切掉数据；它挡的是「上一次会话的键在无会话期间渗进本次结果」。
+            _captureGate.EnterWriteLock();
+            try
+            {
+                _recordedKeys.Clear();
+                _pressedDuringCapture.Clear();
+            }
+            finally
+            {
+                _captureGate.ExitWriteLock();
+            }
+
             _recording = true;
             return true;
         }
@@ -415,7 +470,19 @@ internal sealed class HookService : IDisposable
         // 取消与最后一下松开可能擦肩——等待方已取走结果（_recording 落地为 false）、
         // 但松开与 Cancel 的先后不定，残留的键不清就会带到下一次录制，
         // 让新会话一开始就“已经有键按着了”（设计文档 §5.2 要求会话之间不串）。
-        _recordedKeys.Clear();
+        // 经门锁：本方法跑在 UI 线程 / WaitForCapture 超时的 Task.Run 线程 / Stop，
+        // 与回调线程并发，直接 Clear 会与回调的 Add/Remove 踩踏。
+        _captureGate.EnterWriteLock();
+        try
+        {
+            _recordedKeys.Clear();
+            // 并集一并清掉：它是**本次会话**的产物，跨会话必须归零，否则上一次录的键会混进下一次结果。
+            _pressedDuringCapture.Clear();
+        }
+        finally
+        {
+            _captureGate.ExitWriteLock();
+        }
     }
 
     /// <summary>
@@ -433,7 +500,18 @@ internal sealed class HookService : IDisposable
         // 未闭合的按下集合一并清掉：走到这里要么已有结果（集合本就空——判空时才置的信号），
         // 要么是取消/超时（那一路由 CancelCapture 清）。这里再清一次是给
         // “结果与集合同帧出发”的情形兜底，保证下一次录制从空集合开始。
-        _recordedKeys.Clear();
+        // 经门锁：本方法跑在等待方线程，与回调线程并发。
+        _captureGate.EnterWriteLock();
+        try
+        {
+            _recordedKeys.Clear();
+            // 并集同理：结果已在上方取给 captured，这里清掉才能保证下一次录制从零开始。
+            _pressedDuringCapture.Clear();
+        }
+        finally
+        {
+            _captureGate.ExitWriteLock();
+        }
 
         // 信号在无结果时被置位（例如取消与捕获撞在一起）：返回空，不把脏状态带出去。
         return captured is { } value
@@ -525,6 +603,9 @@ internal sealed class HookService : IDisposable
             _deliverySignal.Dispose();
             _captureSignal.Dispose();
             _deliveryStopping.Dispose();
+            // 钩子已卸、线程已停，此后不再有回调进来，可以安全地排掉门锁。
+            // （放在前四个之后：CancelCapture 在上面已经用过它，不能先排。）
+            _captureGate.Dispose();
         }
     }
 
@@ -1043,10 +1124,14 @@ internal sealed class HookService : IDisposable
     /// 按键捕获（录制）的钩子侧落点（设计文档 §5.2「捕获期间钩子消费掉按键」）。
     ///
     /// <para>
-    /// <b>本方法能进钩子回调，故适用回调的全部禁令</b>（§3.2 约束①）：不取锁、不分配、
-    /// 不做 IO、不碰 UI、不查任务表。它做的三件事都在这条线内：
-    /// ① 声明一次捕获事件（值类型，无装箱）；② 原子换出 + 就地定态（消费语义）；
-    /// ③ 置一个 AutoResetEvent 叫醒等待方——置信号不阻塞、不分配。
+    /// <b>本方法能进钩子回调，故适用回调的全部禁令</b>（§3.2 约束①）：不取锁、不做 IO、
+    /// 不碰 UI、不查任务表。常态按键路径（按下）在此之外——它只做「入集合 + 吞掉」：
+    /// 集合已预分配容量、去重后才 <c>Add</c>，不产生分配。
+    /// </para>
+    /// <para>
+    /// <b>唯一的一处有界分配在收尾</b>：完成时 <c>_pressedDuringCapture.ToArray()</c> 会新建
+    /// 一个长度 ≤ 同时按住键数的数组（人手不会超出预分配量级），一次录制会话只发生一次，
+    /// 不随按键次数增长——“回调不分配”这条纪律在这里按「常态路径」理解，不要当成绝对零分配。
     /// </para>
     /// <para>
     /// <b>为什么捕获事件声明要留在回调线程</b>：整个按下集合在哪个时刻「凑齐」只有回调线程知道
@@ -1061,8 +1146,9 @@ internal sealed class HookService : IDisposable
     /// 等待方醒来后无条件清——三处各自单写、无竞态。
     /// </para>
     /// <para>
-    /// <b>进出规则的唯一载体是 <see cref="_recordedKeys"/></b>：按下入集合并吞掉，
-    /// 松开出集合后<em>再</em>判空——集合空 = 用户的整组键都松了 = 这一组键按完了。
+    /// <b>进出规则的唯一载体是按下集合与它的并集</b>（见 <see cref="_recordedKeys"/> 与
+    /// <see cref="_pressedDuringCapture"/> 的分工）：按下两集都入、吞掉；松开从按下集出，
+    /// 出完<em>再</em>判空——按下集空 = 用户的整组键都松了 = 这一组键按完了。
     /// 完成时把集合**快照一份**交出去（<c>ToArray</c>），因为紧接着的 <c>CancelCapture</c>
     /// 会清空集合，若直接交引用，等待方拿到的可能是被清空后的同一份。
     /// </para>
@@ -1077,9 +1163,24 @@ internal sealed class HookService : IDisposable
         if (isKeyDown)
         {
             // 同一键重复按下（系统自动重复）只记一次：集合是「哪些键按着」，不是「按了几下」。
-            if (!_recordedKeys.Contains(key))
+            // 两集同锁：它们在同一分支里成对写入，分开取锁反而多一次进出。
+            _captureGate.EnterWriteLock();
+            try
             {
-                _recordedKeys.Add(key);
+                if (!_recordedKeys.Contains(key))
+                {
+                    _recordedKeys.Add(key);
+                }
+
+                // 并集另记一份：松开不移除，故它是「本次录制按过哪些键」的唯一权威来源。
+                if (!_pressedDuringCapture.Contains(key))
+                {
+                    _pressedDuringCapture.Add(key);
+                }
+            }
+            finally
+            {
+                _captureGate.ExitWriteLock();
             }
 
             // 按下不产生结果——用户可能还要接着按第二个、第三个键。
@@ -1087,18 +1188,38 @@ internal sealed class HookService : IDisposable
             return new IntPtr(1);
         }
 
-        _recordedKeys.Remove(key);
-
-        // 还有键按着：这一组还没按完，继续等。
-        if (_recordedKeys.Count > 0)
+        // 松开分支：出集、判空、快照三步必须在同一临界区内连做。
+        // 否则取消方可能插在「出集之后、快照之前」把并集清空，快照就取到空集。
+        // 临界区里只做集合操作与快照，不碰 _capturedEvent / 不置信号——
+        // 那两步留在锁外，既缩短持锁时间，也避开「置信号时持锁」的无谓风险。
+        CaptureEvent? completed = null;
+        _captureGate.EnterWriteLock();
+        try
         {
-            return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+            _recordedKeys.Remove(key);
+
+            // 还有键按着：这一组还没按完，继续等。
+            if (_recordedKeys.Count == 0 && _pressedDuringCapture.Count > 0)
+            {
+                // 并集非空（至少有一个键是本次会话里真正按下过的）且按下集已空 = 完成。
+                //
+                // 快照取 _pressedDuringCapture 而**不是** _recordedKeys：后者刚被上面的 Remove 抽干，
+                // 到这里必然为空，用它当结果就会恒交出空数组（旧实现的根因）。
+                completed = new CaptureEvent(_pressedDuringCapture.ToArray());
+            }
+        }
+        finally
+        {
+            _captureGate.ExitWriteLock();
         }
 
-        // 集合清空 = 完成。此时一定至少按过一个键（能走到这里说明刚才那个键在集合里），
-        // 故不必再判空集合。快照一份交出去，避免与 CancelCapture 的清空赛跑。
-        _capturedEvent = new CaptureEvent(_recordedKeys.ToArray());
-        _captureSignal.Set();
+        // 并集为空（或按下集未空）时 completed 保持 null：不置结果、不置信号，继续等。
+        // 并集为空的成因见下方注释。
+        if (completed is not null)
+        {
+            _capturedEvent = completed;
+            _captureSignal.Set();
+        }
 
         return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
     }

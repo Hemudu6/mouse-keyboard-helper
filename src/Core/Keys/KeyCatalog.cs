@@ -235,13 +235,24 @@ public static class KeyCatalog
     /// 未知族名返回空数组（调用方按"查无此族"处理，不抛异常——
     /// 这是热路径上的查询函数，不该成为崩溃点）。
     /// </para>
+    /// <para>
+    /// 四族的表都是 <c>static readonly</c> 常量表，不是每次调用新建——本函数会在
+    /// 每一记键盘事件里、对每个已记账的族各调一次（设计文档 §3.4.1 的对账路径），
+    /// 而回调路径要求不分配（§3.2）。返回类型之所以是 <see cref="IReadOnlyList{T}"/>，
+    /// 正是为了挡住调用方改写这份共享表。
+    /// </para>
     /// </summary>
     public static IReadOnlyList<Key> KeysOfFamily(string family) => family switch
     {
-        "Ctrl" => new[] { Key.LeftCtrl, Key.RightCtrl },
-        "Alt" => new[] { Key.LeftAlt, Key.RightAlt },
-        "Shift" => new[] { Key.LeftShift, Key.RightShift },
-        "Win" => new[] { Key.LWin, Key.RWin },
+        "Ctrl" => CtrlFamily,
+        "Alt" => AltFamily,
+        "Shift" => ShiftFamily,
+        "Win" => WinFamily,
         _ => System.Array.Empty<Key>(),
     };
+
+    private static readonly Key[] CtrlFamily = { Key.LeftCtrl, Key.RightCtrl };
+    private static readonly Key[] AltFamily = { Key.LeftAlt, Key.RightAlt };
+    private static readonly Key[] ShiftFamily = { Key.LeftShift, Key.RightShift };
+    private static readonly Key[] WinFamily = { Key.LWin, Key.RWin };
 }

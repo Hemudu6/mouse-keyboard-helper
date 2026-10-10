@@ -141,7 +141,8 @@ public sealed partial class SettingsPage : Page
         // 本工具的紧急停止**用低级钩子监听**而非 RegisterHotKey（§3.2），所以即使这个组合
         // 空闲，它仍可能与系统快捷键语义重叠（如 Win+L 锁屏），届时两边都会响应。
         // 探测失败只提示、不拦保存：占用是运行环境的事，用户可能就是要先存下来、回头再改。
-        if (HotKeyProbe.TryProbe(_settings.EmergencyStopKey, out var failureMessage))
+        var probeOk = HotKeyProbe.TryProbe(_settings.EmergencyStopKey, out var failureMessage);
+        if (probeOk)
         {
             await ShowMessage(
                 "该键可用",
@@ -163,38 +164,25 @@ public sealed partial class SettingsPage : Page
     }
 
     /// <summary>
-    /// 把钩子给出的按下集合折算成绑定（修饰族固定序：Ctrl → Alt → Shift → Win）。
+    /// 把钩子给出的按下集合折算成绑定。
     ///
     /// <para>
-    /// 判定口径（设计文档 §5.2，方案 B）：集合里**属于修饰键族的键进修饰键**，
-    /// 其余键里挑一个当主键；全为修饰键时（用户就录了 Ctrl+Shift）不挑主键，
-    /// 从集合里的修饰键中取一个当主键——只有这样绑定才表达得出来。
+    /// 判定口径（设计文档 §5.2「一次捕获会话 → 一个绑定」）：集合里**第一个修饰键以外的键当主键**，
+    /// **所有**修饰键（含主键所在族）进修饰集；一个非修饰键都没有时（用户就录了 `Ctrl+Shift`），
+    /// 取固定族序里第一个命中的修饰键当主键，其余修饰键进修饰集。
     /// </para>
     /// </summary>
     private static KeyBinding BuildBinding(HookService.CapturedKeyEvent keyEvent)
     {
-        // 先挑主键（口径见 PickMainKey）：修饰键优先取族代表键，一个修饰键都没有才取集合首键。
-        // 与用户按下顺序无关——顺序无意义，绑定语义是「同时按」。
+        // 先挑主键（口径见 PickMainKey）。与用户按下顺序无关——顺序无意义，绑定语义是「同时按」；
+        // 遍历序固定（族序 Ctrl→Alt→Shift→Win，集合内按录制顺序），故同一组键每次折出的绑定相同。
         var mainKey = PickMainKey(keyEvent.Keys);
-        if (keyEvent.Keys.Length < 2)
-        {
-            // 集合只有 1 个键（或空）时**只有主键**，没有"其余键"可进修饰集。
-            // 这一步不是优化，是正确性：若把主键也算进"其余键"，裸键绑定会变成
-            // 「主键 F6 + 修饰集 [F6]」——同一个键既当主键又当修饰条件，
-            // 任何正常录制路径都产不出来，读起来也无法解释。
-            return mainKey.Mouse is { } singleMouseKey
-                ? KeyBinding.FromMouse(singleMouseKey)
-                : KeyBinding.FromKey(
-                    mainKey.KeyboardVirtualKey
-                        ?? throw new InvalidOperationException(
-                            "捕获到的紧急停止键既不是键盘键也不是鼠标键，无法构造绑定。"));
-        }
 
+        // 鼠标键：组合形态仅键盘（§3.4 组合命中判定），故鼠标键不参与组合；
+        // 钩子侧对鼠标也不维护修饰键族集合。因此直接按「鼠标单键」形态绑定。
+        // 这里**不能**走 KeyboardVirtualKey：鼠标键的该字段为 null，取它就是崩。
         if (mainKey.Mouse is { } mouseKey)
         {
-            // 鼠标键的 KeyboardVirtualKey 为 null，直接取它就是崩。这里按鼠标单键形态绑定，
-            // 让下游 HotKeyProbe 拿到 binding.MainKey == null 后走"鼠标键不能作系统热键"的分支——
-            // 那条分支正是为此存在的（见 HotKeyProbe.TryProbe）。
             return KeyBinding.FromMouse(mouseKey);
         }
 
@@ -202,7 +190,12 @@ public sealed partial class SettingsPage : Page
             ?? throw new InvalidOperationException(
                 "捕获到的紧急停止键既不是键盘键也不是鼠标键，无法构造绑定。");
 
-        var modifiers = CollectModifiers(keyEvent.Keys, mainKey);
+        // 单键形态走这条："其余键"为空，修饰集自然是空的——**不需要**为它单开一条分支。
+        // （旧实现另设 `Keys.Length < 2` 短路，正是因为那时口径反过来、"其余键"里装的是非修饰键。）
+        var modifiers = CollectModifiers(keyEvent.Keys);
+
+        // 无修饰时走 FromKey 而非"空修饰集的 FromCombo"：两者在绑定模型里
+        // 是**两种形态**——单键形态与组合形态，下游（§3.4.1 的 IsCombo）据此分派。
         return modifiers.Count == 0
             ? KeyBinding.FromKey(virtualKey)
             : KeyBinding.FromCombo(modifiers, virtualKey);
@@ -212,58 +205,103 @@ public sealed partial class SettingsPage : Page
     private static readonly string[] FamilyOrder = { "Ctrl", "Alt", "Shift", "Win" };
 
     /// <summary>
-    /// 从捕获到的按下集合里挑主键：**修饰键优先**——
-    /// 按固定族序（Ctrl→Alt→Shift→Win）取第一个命中的修饰键**族代表键**；
-    /// 集合里一个修饰键也没有时取 `keys[0]`。
+    /// 从捕获到的按下集合里挑主键：**第一个非修饰键**（按集合内的录制顺序）；
+    /// 一个都没有时（用户就录了若干修饰键，如 `Ctrl+Shift`）取固定族序
+    /// （Ctrl→Alt→Shift→Win）里第一个命中的修饰键**族代表键**。
     ///
     /// <para>
-    /// <b>为什么修饰键优先而不是"用户按的第一个键"</b>：主键是下游判等的键——
+    /// <b>为什么主键取非修饰键</b>：主键是「这个绑定是哪一个键」的答案，
+    /// 而修饰键是**以修饰身份**参与绑定的（进修饰集）。若把修饰键当主键，
+    /// 被让位的那个真实按键反而要进修饰集——下游的修饰集只认修饰键族，
+    /// 非修饰键会被整个丢掉（`TaskValidator.ModifierFamilies` / `ToggleSnapshot` 的族归一），
+    /// 于是 `Ctrl+F8` 退化成裸 `Ctrl`。
+    /// </para>
+    /// <para>
+    /// <b>修饰键当主键时为什么必须取族代表键</b>：主键是下游判等的键——
     /// 快照的 <c>ToggleSnapshot.Normalize</c> 与任务校验的 <c>ModifierFamilies</c>
     /// 都按**族代表键**归一（左右 Ctrl 视为同族）。若拿用户实按的那把（可能是右 Ctrl）当主键，
     /// 与族代表键比对会**查不中**，于是"钩子命中了、引擎却找不到任务"。
     /// 取族代表键即与归一口径一致。
     /// </para>
     /// <para>
-    /// <b>派生形态对照</b>：<c>Ctrl+K</c> → 主键 Ctrl、修饰集 <c>[K]</c>；
-    /// <c>Ctrl+Shift</c> → 主键 Ctrl、修饰集 <c>[Shift]</c>（见 <see cref="CollectModifiers"/>）；
+    /// <b>派生形态对照</b>：<c>Ctrl+F8</c> → 主键 F8、修饰集 <c>[Ctrl]</c>；
+    /// <c>Ctrl+Shift</c> → 主键 Ctrl、修饰集 <c>[Ctrl, Shift]</c>（见 <see cref="CollectModifiers"/>）；
     /// <c>F6</c> → 主键 F6、修饰集空（单键形态）。
     /// </para>
     /// </summary>
     private static PhysicalKey PickMainKey(IReadOnlyList<PhysicalKey> keys)
     {
-        foreach (var family in FamilyOrder)
+        // 单趟扫出「第一个非修饰键」与「固定族序里第一个命中的修饰键代表键」。
+        PhysicalKey? firstModifier = null;
+        int firstModifierRank = int.MaxValue;
+
+        foreach (var pressed in keys)
         {
-            foreach (var key in KeyCatalog.KeysOfFamily(family))
+            if (pressed.KeyboardVirtualKey is not { } virtualKey)
             {
-                foreach (var pressed in keys)
-                {
-                    if (pressed.KeyboardVirtualKey == key)
-                    {
-                        return pressed;
-                    }
-                }
+                // 鼠标键没有修饰键族概念，天然是非修饰键——但也当不了组合的主键
+                // （组合形态仅键盘，§3.4）。它只可能出现在单键捕获里，
+                // 那种情形由 BuildBinding 的鼠标分支接手，走不到这里的主键语义。
+                continue;
+            }
+
+            if (KeyCatalog.ModifierFamily(virtualKey) is not { } family)
+            {
+                return pressed;
+            }
+
+            var rank = System.Array.IndexOf(FamilyOrder, family);
+            if (rank < firstModifierRank)
+            {
+                firstModifier = pressed;
+                firstModifierRank = rank;
             }
         }
 
+        if (firstModifier is not null)
+        {
+            // 手写分支（不用 `is { } x`）：`PhysicalKey` 是 struct，
+            // 模式变量对可空值取的是**内部值**而非包好的可空量，`'return vk;` 会退回 WpfKey。
+            return firstModifier.Value;
+        }
+
+        // 空集合不得取下标：钩子侧已经拦掉「只见到松开、没见到按下」的半截事件，
+        // 但这里再采一道——BuildBinding 的调用方是 async void，一旦越界异常逃逸
+        // 就是整个提权进程崩溃，不能把这条命根全押在上游。
+        if (keys.Count == 0)
+        {
+            throw new InvalidOperationException("捕获结果为空，无法折出主键。");
+        }
+
+        // 只剩鼠标键（BuildBinding 的鼠标分支已先行接管，正常不可达）。
         return keys[0];
     }
 
     /// <summary>
-    /// 把按下集合里其余的修饰键折成绑定用的修饰键列表：每族**至多一个代表键**
+    /// 把按下集合里的修饰键折成绑定用的修饰键列表：每族**至多一个代表键**
     /// （左右归一，见 KeyCatalog），按固定族序排列。
     ///
     /// <para>
-    /// 主键本身即使是个修饰键也不再重复进列表（它已经是主键了）。
+    /// <b>主键所在的那个族也在内</b>：主键是修饰键时（用户只录了修饰键），
+    /// 它同时是「按下的是哪个键」与「必须按着哪个修饰键」——这是同一件事的两个说法，
+    /// 少写一半绑定就残了（`Ctrl+Shift` 会退化成裸 `Ctrl`）。
+    /// 主键是非修饰键时它不在任何修饰键族里，本分支自然不命中。
+    /// </para>
+    /// <para>
+    /// <b>非修饰键一律不进修饰集</b>：修饰集的每一项在命中判定（§3.4.1）与校验判等
+    /// （`TaskValidator.ModifierFamilies`）里都被当作**修饰键族**归一——
+    /// 塞进一个非修饰键（如 `Ctrl+F8` 里的 F8），它会在比对时被整个丢掉，
+    /// 于是「按 Ctrl+F8」与「按 Ctrl」再也分不开。
     /// </para>
     /// </summary>
-    private static List<WpfKey> CollectModifiers(IReadOnlyList<PhysicalKey> keys, PhysicalKey mainKey)
+    private static List<WpfKey> CollectModifiers(IReadOnlyList<PhysicalKey> keys)
     {
         var modifiers = new List<WpfKey>();
         foreach (var family in FamilyOrder)
         {
             foreach (var pressed in keys)
             {
-                if (pressed == mainKey || pressed.KeyboardVirtualKey is not { } virtualKey)
+                if (pressed.KeyboardVirtualKey is not { } virtualKey)
                 {
                     continue;
                 }
