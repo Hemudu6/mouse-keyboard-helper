@@ -490,6 +490,9 @@ $RECYCLE.BIN/
 publish/
 [Pp]ublish[Oo]utput/
 
+# 分发目录（Launcher + Host 双 exe，单件约 370 MB，二进制不入库）
+分发/
+
 # WinUI 3 / MSIX 相关（本项目为非打包分发，但保留以防误引入）
 AppPackages/
 BundleArtifacts/
