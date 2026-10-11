@@ -57,8 +57,8 @@
       三重纳入冲突：那条链路的成员是「None 通配 / Content 通配 / 显式 Content 复制项」，
       ApplicationIcon 不在其中，既不进 ResolvedFileToPublish，也不改任何一项的元数据。
 
-      图标唯一源：Assets\AppIcon.ico（与 MainWindow.xaml / MainWindow.xaml.cs 的
-      SetIcon 同源），改一处即 ①③ 同时生效。
+      图标唯一源：Assets\AppIcon.ico（与 MainWindow / TrayIcon 取的 PE 资源同源），
+      改一处即 ①③ 同时生效。
     -->
     <ApplicationIcon>Assets\AppIcon.ico</ApplicationIcon>
   </PropertyGroup>
@@ -94,7 +94,9 @@
     三者 TargetPath 相同但元数据不同，ResolveOverlappingItemGroupConflicts 的 Distinct() 去不掉，
     结果 ResolvedFileToPublish 里同一文件出现三次，下游 _SplitResolvedFileToPublishItems 的
     条件匹配失效 → _CopyResolvedFilesToPublishPreserveNewest 为空 → publish 产物无 Assets 目录。
-    而 MainWindow.xaml.cs:22 的 AppWindow.SetIcon("Assets/AppIcon.ico") 会因找不到文件失败。
+    而窗口图标（MainWindow）与托盘图标（TrayIcon）都改从 exe 的 PE 资源取，
+    不再依赖产物目录里存在 Assets\ —— 发布产物无该目录也不影响显示（旧版按
+    文件路径取图标曾因此退回默认图标）。
 
     处理：①③ 各自排除该文件，只留下方唯一一条带复制元数据的显式 Content 项。
     占位说明（为何不靠通配符）：Assets 目录下除 AppIcon.ico 外不放任何文件——

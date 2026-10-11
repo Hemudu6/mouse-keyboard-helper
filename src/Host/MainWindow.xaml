@@ -18,11 +18,7 @@
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
 
-        <TitleBar x:Name="AppTitleBar" Title="鼠标键盘辅助">
-            <TitleBar.IconSource>
-                <ImageIconSource ImageSource="Assets/AppIcon.ico" />
-            </TitleBar.IconSource>
-        </TitleBar>
+        <TitleBar x:Name="AppTitleBar" Title="鼠标键盘辅助" />
 
         <!--
             The Frame hosts pages for your application content. Add your UI to
