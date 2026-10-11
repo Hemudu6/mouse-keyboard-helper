@@ -94,14 +94,14 @@ internal sealed class TrayIcon : IDisposable
     /// 在主窗口上创建托盘图标并开始接管回调消息。
     /// </summary>
     /// <param name="hwnd">
-    /// **WinUI 主窗口**的 HWND。<b>必须在窗口 <c>Activated</c> 之后取</b>——
-    /// 早于此时机句柄尚无效（§6.3、§6.5.5）。
+    /// **WinUI 主窗口**的 HWND。<b>在窗口 <c>Activated</c> 之后取</b>（§6.3、§6.5.5）——
+    /// 句柄自窗口构造起即有效，此处选在 <c>Activated</c> 后是为了“窗口完全就绪再挂托盘”。
     /// </param>
     internal TrayIcon(IntPtr hwnd)
     {
         if (hwnd == IntPtr.Zero)
         {
-            throw new ArgumentException("主窗口句柄无效（须在 Activated 之后取得）。", nameof(hwnd));
+            throw new ArgumentException("主窗口句柄无效（应为窗口 Activated 之后经 GetWindowHandle 取得）。", nameof(hwnd));
         }
 
         _hwnd = hwnd;
@@ -130,12 +130,24 @@ internal sealed class TrayIcon : IDisposable
     }
 
     /// <summary>
-    /// 取托盘图标：优先用宿主自身的图标资源（与任务栏上的一致），取不到则退回系统默认图标。
+    /// 取应用图标：优先用宿主 exe 自身的图标资源，取不到则退回系统默认图标。
+    ///
+    /// <para>
+    /// <b>两个调用方共用这一处实现</b>：托盘图标（本类构造函数）与窗口/任务栏图标
+    /// （<c>MainWindow</c> 经 <c>WM_SETICON</c>）——两处必须同源，
+    /// 否则换了图标会出现"托盘变了、任务栏没变"的不一致（这正是曾经的缺陷）。
+    /// </para>
+    ///
+    /// <para>
+    /// <b>取自 exe 的 PE 资源</b>，不走文件路径——因为发布形态是单文件自包含，
+    /// 产物目录里没有 <c>Assets\</c> 文件夹，任何指向 <c>Assets/AppIcon.ico</c>
+    /// 的相对路径在发布产物里都解析不到。
+    /// </para>
     /// </summary>
     /// <param name="isShared">
     /// 输出：所取句柄是否为系统共享图标（决定 <see cref="Dispose"/> 能否销毁它）。
     /// </param>
-    private static IntPtr LoadIcon(out bool isShared)
+    internal static IntPtr LoadIcon(out bool isShared)
     {
         var module = GetModuleHandle(null);
         var icon = ExtractIcon(module, Environment.ProcessPath ?? string.Empty, 0);
@@ -360,6 +372,9 @@ internal sealed class TrayIcon : IDisposable
     [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW", SetLastError = true)]
     private static extern IntPtr SetWindowLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
 
+    [DllImport("user32.dll", EntryPoint = "SendMessageW", SetLastError = true)]
+    internal static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
     [DllImport("user32.dll", EntryPoint = "CallWindowProcW", SetLastError = true)]
     private static extern IntPtr CallWindowProc(IntPtr lpPrevWndFunc, IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 
@@ -395,7 +410,7 @@ internal sealed class TrayIcon : IDisposable
 
     [DllImport("user32.dll", EntryPoint = "DestroyIcon", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool DestroyIcon(IntPtr hIcon);
+    internal static extern bool DestroyIcon(IntPtr hIcon);
 
     [DllImport("user32.dll", EntryPoint = "LoadIconW", SetLastError = true)]
     private static extern IntPtr LoadIconW(IntPtr hInstance, IntPtr lpIconName);

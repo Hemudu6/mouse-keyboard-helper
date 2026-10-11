@@ -490,6 +490,9 @@ $RECYCLE.BIN/
 publish/
 [Pp]ublish[Oo]utput/
 
+# 分发目录（Launcher + Host 双 exe，单件约 370 MB，二进制不入库）
+分发/
+
 # WinUI 3 / MSIX 相关（本项目为非打包分发，但保留以防误引入）
 AppPackages/
 BundleArtifacts/
@@ -512,3 +515,7 @@ TestResults/
 # 项目本地编辑器/工具状态
 .tmp/
 *.tmp
+
+# 图标生成脚本的预览图（由 tools/make_icon.py 重新生成，不入库）
+tools/*_p256.png
+tools/*_p48.png
