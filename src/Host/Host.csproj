@@ -49,6 +49,18 @@
     <PublishTrimmed>false</PublishTrimmed>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!--
+      exe 文件图标（资源管理器 / 任务栏所见，需求：① 任务栏图标 + ③ exe 文件图标）。
+
+      ApplicationIcon 是**纯编译期**属性（写进 PE 的 RT_ICON / RT_GROUP_ICON 资源），
+      不参与 publish 的复制管线——因此这里指向 Assets 目录**不会**重蹈下方注释所述的
+      三重纳入冲突：那条链路的成员是「None 通配 / Content 通配 / 显式 Content 复制项」，
+      ApplicationIcon 不在其中，既不进 ResolvedFileToPublish，也不改任何一项的元数据。
+
+      图标唯一源：Assets\AppIcon.ico（与 MainWindow.xaml / MainWindow.xaml.cs 的
+      SetIcon 同源），改一处即 ①③ 同时生效。
+    -->
+    <ApplicationIcon>Assets\AppIcon.ico</ApplicationIcon>
   </PropertyGroup>
 
   <!--

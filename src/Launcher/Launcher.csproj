@@ -23,6 +23,13 @@
     <PublishSingleFile>true</PublishSingleFile>
     <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
     <PublishTrimmed>false</PublishTrimmed>
+    <!--
+      exe 文件图标：与宿主同源（跨项目引到 Host 的 Assets\AppIcon.ico），
+      维持「全产品只有一个图标源」——用户视角 Launcher 与宿主是同一个软件。
+      ApplicationIcon 为纯编译期属性（写 PE 资源），不参与 publish 复制管线；
+      Launcher 自身无 Assets 目录，故无 Host 侧那类通配符冲突。
+    -->
+    <ApplicationIcon>..\Host\Assets\AppIcon.ico</ApplicationIcon>
   </PropertyGroup>
 
 </Project>

@@ -515,3 +515,7 @@ TestResults/
 # 项目本地编辑器/工具状态
 .tmp/
 *.tmp
+
+# 图标生成脚本的预览图（由 tools/make_icon.py 重新生成，不入库）
+tools/*_p256.png
+tools/*_p48.png
