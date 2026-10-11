@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Windows.Input;
+using Core.Diagnostics;
 using Core.Input;
 using Core.Keys;
 
@@ -105,6 +106,32 @@ internal sealed class HookService : IDisposable
     /// </para>
     /// </summary>
     private readonly Dictionary<string, int> _pressedModifierFamilies = new();
+
+    /// <summary>
+    /// 每一族「最后一次记账时刻」（<see cref="Environment.TickCount64"/>，单调递增毫秒）。
+    /// <b>与 <see cref="_pressedModifierFamilies"/> 同生共死</b>：族被记账时写入、被移除时一并移除。
+    ///
+    /// <para>
+     /// <b>为什么需要它</b>：对账用 <see cref="GetAsyncKeyState"/> 核实「是否真的还按着」，但该 API 读的是
+     /// <b>全局异步键盘状态</b>，与低层钩子的事件队列是两条独立通路 —— 在 key-down 回调内读它，
+     /// 该按键的物理状态未必已反映进来（实测：按下 Ctrl 的瞬间读出 0x0000，松开瞬间读出 0x8000，
+     /// 事件与读数整整错开一拍）。若不加区分地对「刚记账的族」也做残留判定，
+     /// 刚建立的正确状态会被当场误删（实测：记账后集合恒为 []，组合键 100% 失灵）。
+     /// </para>
+     /// <para>
+     /// <b>无锁</b>：本表只在回调线程读写，且 <c>long</c> 读写原子；<see cref="Environment.TickCount64"/> 无 IO。
+     /// 不违反 §3.2「回调永不取锁」纪律。
+     /// </para>
+     /// </summary>
+    private readonly Dictionary<string, long> _familyTouchedAt = new();
+
+    /// <summary>
+    /// 对账的<b>宽限期</b>（毫秒，设计文档 §3.4.1）：记账后不足此时长的族不参与残留判定。
+    /// 残留的特征是<b>持续</b>为假，误判是<b>瞬间</b>为假；250ms 远大于实测的「错开一拍」（毫秒级），
+    /// 远小于用户可感知的卡顿，且 UAC 漏收 key-up 后用户切回普通桌面早已超过此时长——
+    /// 残留清理能力不受影响。
+    /// </summary>
+    private const long ReconcileGraceMs = 250;
 
     // ── 按键捕获（录制）─────────────────────────────────────────
 
@@ -318,6 +345,33 @@ internal sealed class HookService : IDisposable
     /// </para>
     /// </summary>
     public event Action<PhysicalKey, bool, string[], Guid?>? ToggleRequested;
+
+    /// <summary>
+    /// 钩子服务在 <b>钩子回调路径之外</b>的诊断输出口。
+    ///
+    /// <para>
+    /// <b>为什么是「事后注入」而不是构造参数</b>：本服务的唯一构造点是组合根
+    /// <c>HostFacade</c>，而日志器 <see cref="Core.Diagnostics.ILogSink"/> 需要进程唯一的那一份（<c>HostFacade.Logger</c>）。
+    /// 把日志器塞进构造参数会让每一处 <c>new</c> 都多带一个参数，而可空属性只影响需要落盘的那几条路径。
+    /// </para>
+    /// <para>
+    /// <b>可空是有意的</b>：没注入日志器时全部诊断退化成静默（与改动前一致），
+    /// 不会因为“忘了接线”而让钩子服务本身不可用。
+    /// </para>
+    /// <para>
+    /// <b>调用位置约束</b>：<see cref="Core.Diagnostics.ILogSink"/> 的实现做文件 IO，
+    /// 故本属性<b>只允许在回调路径之外</b>使用——泵线程上（重装 / 摘装）可以，
+    /// <see cref="OnKeyboard"/> / <see cref="OnMouse"/> 内不可以（§3.2 约束①：IO 会让回调超出
+    /// <c>LowLevelHooksTimeout</c>，被系统静默摘钩且无从感知）。
+    /// </para>
+    /// </summary>
+    public ILogSink? Log { get; set; }
+
+    /// <summary>
+    /// <see cref="Log"/> 的当前值。每处用点都重新读属性，而不是把属性值捕获进线程——
+    /// 接线（<c>HostFacade</c> 注入）发生在 <see cref="Start"/> 之后，捕获住早期值会让诊断全哑。
+    /// </summary>
+    private ILogSink? _log => Log;
 
     /// <summary>
     /// 构造。不做任何系统调用、不建线程——资源在 <see cref="Start"/> 时创建。
@@ -954,12 +1008,16 @@ internal sealed class HookService : IDisposable
             _pressedModifierFamilies[family] = _pressedModifierFamilies.TryGetValue(family, out var count)
                 ? count + 1
                 : 1;
+            // 记账即打时间戳（设计文档 §3.4.1「宽限期」）：auto-repeat 连发 down 也会持续刷新，
+            // 该族始终享有宽限期——这正是抑制「刚记账就被对账误删」的机制。
+            _familyTouchedAt[family] = Environment.TickCount64;
         }
         else if (_pressedModifierFamilies.TryGetValue(family, out var count))
         {
             if (count <= 1)
             {
                 _pressedModifierFamilies.Remove(family);
+                _familyTouchedAt.Remove(family); // 两表同生共死，避免时间戳表泄留孤儿键
             }
             else
             {
@@ -1003,9 +1061,18 @@ internal sealed class HookService : IDisposable
         // 不能在枚举字典的同时删除元素（会抛 InvalidOperationException）——
         // 故先收集待删族名，再统一移除。
         List<string>? stale = null;
+        var now = Environment.TickCount64;
         foreach (var family in _pressedModifierFamilies.Keys)
         {
             if (IsFamilyPhysicallyDown(family))
+            {
+                continue;
+            }
+
+            // 宽限期（设计文档 §3.4.1）：刚记账的族可能只是「事件已到、GetAsyncKeyState 读数未跟上」，
+            // 不能凭一次瞬时为假就判残留。越过宽限期仍为假的，才是真残留。
+            if (_familyTouchedAt.TryGetValue(family, out var touchedAt)
+                && now - touchedAt < ReconcileGraceMs)
             {
                 continue;
             }
@@ -1021,6 +1088,7 @@ internal sealed class HookService : IDisposable
         foreach (var family in stale)
         {
             _pressedModifierFamilies.Remove(family);
+            _familyTouchedAt.Remove(family);
         }
     }
 
@@ -1443,6 +1511,9 @@ internal sealed class HookService : IDisposable
             // 加一行调试输出零成本：正常路径（已订阅）不付这个钱，异常路径至少留下痕迹。
             System.Diagnostics.Debug.WriteLine(
                 $"[HookService] 开关事件无订阅者，已丢弃：key={item.Key}, down={item.IsKeyDown}, taskId={item.TaskId?.ToString() ?? "<紧急停止>"}");
+            _log?.Error(
+                $"开关事件无订阅者，已丢弃：key={item.Key}, down={item.IsKeyDown}, "
+                + $"taskId={item.TaskId?.ToString() ?? "<紧急停止>"}");
             return;
         }
 
@@ -1454,6 +1525,10 @@ internal sealed class HookService : IDisposable
         {
             System.Diagnostics.Debug.WriteLine(
                 $"[HookService] 开关事件订阅方抛出异常（key={item.Key}, taskId={item.TaskId?.ToString() ?? "<紧急停止>"}）：{ex}");
+            _log?.Error(
+                $"开关事件订阅方抛出异常（key={item.Key}, "
+                + $"taskId={item.TaskId?.ToString() ?? "<紧急停止>"}）",
+                ex);
         }
     }
 

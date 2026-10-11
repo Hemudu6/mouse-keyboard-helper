@@ -264,10 +264,19 @@ public sealed class CommandRow : INotifyPropertyChanged
     //
     // WinUI 的下拉控件绑定 SelectedIndex 而不是选中项本身（ComboBoxItem 内联在
     // XAML 里无法直接绑 SelectedItem）。故为每个固定集合补一对「序号 ⇄ 值」属性。
-    // 序号一律取枚举的落盘整数值（枚举的顺序即界面顺序，禁重排——见 CommandKind
-    // 等枚举的注释：整数编码已落盘）。
+    //
+    // ── 「界面序号」与「枚举落盘值」是两回事（勿混同）──────────────
+    //
+    // 枚举的整数编码是**落盘格式**，界面序是**显示顺序**，两者各自独立演进；
+    // 只有当二者**恰好一致**时，裸 (int) 转换才碰巧正确——那是巧合，不是保证，
+    // 一旦有人调整枚举序（例如把 None 挪到末尾）就会静默错位。
+    //
+    // 因此口径统一为：**凡界面序与枚举值不一致的，一律走显式映射表**（TapModeIndex
+    // 即此类）；恰好一致的保留裸 (int) 转换，但必须逐项标注「项序已核」，
+    // 并在枚举侧改动时同步复核。
 
-    /// <summary>命令类型下拉的选中序号（<see cref="CommandKind"/> 的整数值）。</summary>
+    /// <summary>命令类型下拉的选中序号（<see cref="CommandKind"/> 的整数值）。
+    /// <para>项序已核：枚举序与 <c>TaskEditPage.xaml</c> 的选项序逐项一致。</para></summary>
     public int KindIndex
     {
         get => (int)Kind;
@@ -280,20 +289,45 @@ public sealed class CommandRow : INotifyPropertyChanged
         }
     }
 
-    /// <summary>执行形态下拉的选中序号（<see cref="TapMode"/> 的整数值：单次点按 / 按住 / 不适用）。</summary>
+    /// <summary>
+    /// 执行形态下拉的选中序号（界面序：单次点按 / 按住 / 不适用）。
+    ///
+    /// <para>
+    /// <b>必须走显式映射，禁裸 (int) 转换</b>：界面序按「用户易读」排列（不适用排在末尾），
+    /// 而 <see cref="TapMode"/> 的落盘值按「无值在前」编码（<c>None=0</c> 在首位），
+    /// 二者序不同。裸转换会整体错位一格——选「按住」存成 <see cref="TapMode.Tap"/>、
+    /// 选「不适用」存成 <see cref="TapMode.Hold"/>，回填时同样反向错位。
+    /// </para>
+    /// </summary>
     public int TapModeIndex
     {
-        get => (int)TapMode;
+        get => Array.IndexOf(TapModeDisplayOrder, TapMode);
         set
         {
-            if (value >= 0 && value <= (int)TapMode.Hold)
+            if (value >= 0 && value < TapModeDisplayOrder.Length)
             {
-                TapMode = (TapMode)value;
+                TapMode = TapModeDisplayOrder[value];
             }
         }
     }
 
-    /// <summary>鼠标按键下拉的选中序号（<see cref="MouseKey"/> 的整数值）。</summary>
+    /// <summary>
+    /// 执行形态下拉的**界面显示序**（下标 = 界面序号，值 = 落盘枚举值）。
+    ///
+    /// <para>
+    /// 本表是下拉选项序的唯一权威：<c>TaskEditPage.xaml</c> 里那三个 ComboBoxItem
+    /// 的先后必须与它一致，增删改都必须同步核对，否则 <see cref="TapModeIndex"/> 会静默错位。
+    /// </para>
+    /// </summary>
+    private static readonly TapMode[] TapModeDisplayOrder =
+    {
+        TapMode.Tap,   // 界面第 1 项：单次点按
+        TapMode.Hold,  // 界面第 2 项：按住
+        TapMode.None,  // 界面第 3 项：不适用
+    };
+
+    /// <summary>鼠标按键下拉的选中序号（<see cref="MouseKey"/> 的整数值）。
+    /// <para>项序已核：枚举序与 <c>TaskEditPage.xaml</c> 的选项序逐项一致。</para></summary>
     public int MouseButtonIndex
     {
         get => (int)MouseButton;
@@ -306,7 +340,8 @@ public sealed class CommandRow : INotifyPropertyChanged
         }
     }
 
-    /// <summary>滚动方向下拉的选中序号（<see cref="ScrollDirection"/> 的整数值：向上 / 向下）。</summary>
+    /// <summary>滚动方向下拉的选中序号（<see cref="ScrollDirection"/> 的整数值：向上 / 向下）。
+    /// <para>项序已核：枚举序与 <c>TaskEditPage.xaml</c> 的选项序逐项一致。</para></summary>
     public int ScrollDirectionIndex
     {
         get => (int)ScrollDirection;

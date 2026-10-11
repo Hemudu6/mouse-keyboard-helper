@@ -113,7 +113,9 @@ public sealed class HostFacade : IDisposable
         Scheduler = new Scheduler(Input, Logger);
 
         // ③ 钩子：独立持有，先于 Start 把快照推过去，免得装钩子后有一瞬空表。
-        Hooks = new HookService();
+        //    诊断日志器在这里注入：钩子服务在 UI 层被 new 出来，拿不到进程唯一的日志器，
+        //    只能用可空属性事后接上（拿不到就退化成静默，不影响钩子本身可用）。
+        Hooks = new HookService { Log = Logger };
         RefreshToggleTable();
 
         // ④ 开关命中链路：钩子事件 → 查任务 Id → 启停。
